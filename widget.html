@@ -1,0 +1,1955 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>倒计时</title>
+<style>
+  /* ============ 基础 ============
+     和「待办清单」「天气卡片」同一套视觉语言（视觉一致，代码独立）：玻璃底 + 桌面快照做背景。
+     卡片尺寸 250x264、圆角 24。尺寸刻意做小：这类卡是「瞥一眼」用的，
+     不需要占一块地方（窗口由主进程按 CARD_W/H + 投影边距算）。 */
+  *{ box-sizing:border-box; }
+  html,body{
+    margin:0; padding:0; width:100%; height:100%;
+    background:transparent; overflow:hidden;
+    font-family:-apple-system,"Segoe UI Variable Display","Segoe UI","Microsoft YaHei UI",system-ui,sans-serif;
+    color:#fff;
+    cursor:default; user-select:none;
+    -webkit-app-region:no-drag;
+  }
+  :root{
+    --a:1;            /* 底色浓度（外观滑杆） */
+    --frost:0px;      /* 快照模糊半径 */
+    --red:#FF5A5A;
+    --ink1:rgba(255,255,255,.96);
+    --ink2:rgba(255,255,255,.62);
+    --ink3:rgba(255,255,255,.34);
+    /* 参考图是近黑中性玻璃：不是蓝灰。三个色标都很暗，靠内侧高光提亮边缘 */
+    --g1:#333333; --g2:#242424; --g3:#191919;
+  }
+
+  /* 桌面快照背景：真透明在桌面层里只透壁纸、透不出图标，所以垫一张快照 */
+  #bd{
+    /* ★ 关键：filter:blur 会把结果往元素盒子外面扩，border-radius 只裁盒子本身、
+       裁不住模糊外溢 —— 四角那圈"露边"就是它。
+       clip-path 作用在滤镜之后，能真正把外溢裁掉（半径必须和 .card 一致）。 */
+    border-radius:30px;
+    clip-path:inset(0 round 30px);
+    position:absolute; inset:0; z-index:0; pointer-events:none;
+    background-size:100% 100%; background-repeat:no-repeat;
+    opacity:0; transition:opacity .25s ease;
+    filter:blur(var(--frost));
+  }
+  body.has-bd #bd{ opacity:1; }
+  /* 真透明模式：不画桌面快照，让系统真实混合后面的窗口 */
+  body.noreg #bd{ display:none; }
+  /* 卡片完全不透明时，这层快照本来就看不见，但 blur 出来的光晕会从圆角外侧
+     漏出一圈浅色边 —— 直接不画它。 */
+  body.opaque #bd{ display:none; }
+  /* ★ 桌面层（Progman 子窗口）：子窗口里 alpha=0 的像素会渲染成黑色，
+     而 SetWindowRgn 硬裁又是 1 位掩码（圆角全是台阶）。
+     改成让快照铺满整个窗口、取消圆角裁剪 —— 圆角外那圈显示的就是"桌面本身"，
+     圆角只由 .card 的 border-radius 做抗锯齿过渡，既没黑角也没锯齿。
+     ★ 必须排在 body.noreg / body.opaque 之后：同优先级、后写的赢。 */
+  body.dlayer #bd{ display:block; clip-path:none; }
+  /* ★ 置顶模式（不在桌面层）：窗口本身 per-pixel 透明，露出来的就是背后真实的窗口 ——
+     不需要快照，圆角只由 .card 的 border-radius 抗锯齿，一定干净。 */
+  body:not(.dlayer) #bd{ display:none; }
+
+  .card{
+    position:absolute; inset:0;
+    isolation:isolate;          /* 子元素（滚轮合成层）不许压过面板 */
+    border-radius:30px;
+    overflow:hidden;
+    /* 滚动时 .band 会变成独立合成层，光靠 overflow:hidden 有时裁不住圆角，
+       四个角会露出直角。再叠一层 clip-path 兜底（半径必须和 border-radius 一致）。 */
+    clip-path:inset(0 round 30px);
+    background-image:linear-gradient(178deg,
+      color-mix(in srgb, var(--g1) calc(var(--a) * 100%), transparent) 0%,
+      color-mix(in srgb, var(--g2) calc(var(--a) * 100%), transparent) 46%,
+      color-mix(in srgb, var(--g3) calc(var(--a) * 100%), transparent) 100%);
+    /* 近黑底上，.13 的顶部高光和 .07 的描边会显成一条明显的白边
+       （实测边缘 89 灰、卡片内只有 44）——压到几乎看不出为止。 */
+    box-shadow:
+      inset 0 1px 0 rgba(255,255,255,.05),
+      inset 0 0 0 1px rgba(255,255,255,.04),
+      inset 0 0 70px rgba(0,0,0,.45);
+  }
+  /* 顶部一层极淡的高光，让卡片"立"起来 */
+  .card::after{
+    content:""; position:absolute; inset:0; z-index:1; pointer-events:none;
+    border-radius:inherit;
+    background:radial-gradient(120% 80% at 16% -6%, rgba(255,255,255,.055), transparent 58%);
+  }
+
+  /* ============ 左侧：分钟滚轮 ============ */
+  .wheel{
+    position:absolute; left:0; top:0; width:172px; height:100%;
+    z-index:2;
+    /* 上下淡出：越远越淡，像真滚轮 */
+    -webkit-mask-image:linear-gradient(to bottom, transparent 0, #000 22%, #000 78%, transparent 100%);
+            mask-image:linear-gradient(to bottom, transparent 0, #000 22%, #000 78%, transparent 100%);
+  }
+  /* 圆柱滚轮：7 个槽位。越远越小、越暗、越靠上/下——模拟圆柱面的透视压缩 */
+  .num{
+    /* 左边距 22（原来 35）：两位数的右边缘要离竖线/圆点留出空隙，
+       否则"25"会直接压在圆点上，看着很挤 */
+    position:absolute; left:22px; right:0;
+    text-align:left; line-height:1; font-variant-numeric:tabular-nums;
+    transform:translateY(-50%);
+    transition:font-size .18s ease, color .18s ease, opacity .18s ease;
+    will-change:transform,opacity;
+  }
+  .num.s-3{ top:calc(50% - 112px); font-size:15px; color:#3D3D3D; }
+  .num.s-2{ top:calc(50% - 89px);  font-size:22px; color:#575757; }
+  .num.s-1{ top:calc(50% - 53px);  font-size:30px; color:#8E8E8E; }
+  .num.s0.wide{ font-size:34px; letter-spacing:0; }
+  .num.s0 {
+    top:50%; font-size:48px; font-weight:500; letter-spacing:-1px;
+    color:#fff; text-shadow:0 0 22px rgba(255,255,255,.10);
+  }
+  .num.s1 { top:calc(50% + 53px);  font-size:30px; color:#8E8E8E; }
+  .num.s2 { top:calc(50% + 89px);  font-size:22px; color:#575757; }
+  .num.s3 { top:calc(50% + 112px); font-size:15px; color:#3D3D3D; }
+
+  /* 竖向标尺：一条极淡的竖线 + 每格一道短刻度（参考图里那根） */
+  /* 竖线不是均匀的：中间最亮，往两端渐隐（参考图里那根"凹槽"） */
+  .ruler{
+    /* 跟着卡片透明度一起变淡：不然整张卡半透明、这两根柱子还全亮，很扎眼 */
+    opacity:var(--a);
+    position:absolute; left:97px; top:0; bottom:0; width:3px; z-index:2;
+    background:linear-gradient(to bottom,
+      rgba(255,255,255,.055) 0%,
+      rgba(255,255,255,.11) 24%,
+      rgba(255,255,255,.17) 50%,
+      rgba(255,255,255,.11) 76%,
+      rgba(255,255,255,.055) 100%);
+    box-shadow:1px 0 0 rgba(0,0,0,.45);
+  }
+  /* 液位：从顶端到圆点这一段的竖线是琥珀→红的渐变（参考图里最提气的一笔） */
+  .ruler-fill{
+    /* 下端钉在圆点（bottom:50%），高度由 JS 按"格数"给：
+       一格 = 中心到相邻数字的距离（53px），0→1 正好一格，3 格顶到卡片上沿 */
+    position:absolute; left:97px; top:auto; bottom:50%; height:0; width:3px; z-index:3;
+    background:linear-gradient(to bottom,
+      #F6D48C 0%, #EFB36B 26%, #E88A57 58%, #E4633F 100%);
+    box-shadow:0 0 10px rgba(240,160,90,.35), 0 0 3px rgba(255,180,120,.5);
+    border-radius:2px 2px 0 0;
+    opacity:0;
+    transition:opacity .26s ease, height .15s cubic-bezier(.22,.7,.25,1);
+  }
+  /* 默认态（0 分钟）没有液位：整条竖线是灰的。设了时间才亮起来 */
+  .card.filled .ruler-fill{ opacity:var(--a); }
+  .ticks i{
+    position:absolute; left:132px; height:4px; border-radius:2px;
+    background:rgba(255,255,255,.32); z-index:2;
+    /* ★ 数字是用 translateY(-50%) 把"格点"对到中心的，刻度也必须这么对，
+       否则刻度中心比数字中心低 2px（半个刻度高），看起来就是"没对齐"。 */
+    transform:translateY(-50%);
+  }
+  /* 中间那根最长，往两端逐级变短、变暗（跟数字的大小变化同一条曲线） */
+  .ticks i.t-3{ top:calc(50% - 112px); width:8px;  background:rgba(255,255,255,.16); }
+  .ticks i.t-2{ top:calc(50% - 89px);  width:11px; background:rgba(255,255,255,.22); }
+  .ticks i.t-1{ top:calc(50% - 53px);  width:15px; background:rgba(255,255,255,.30); }
+  /* 中心那根刻度永远被红条盖着；不藏的话，红条尾端一渐隐它就透出来
+     （用户看到的"红条右边的小黑点"） */
+  .ticks i.t0 { top:50%; width:20px; background:rgba(255,255,255,.38); opacity:0; }
+  .ticks i.t1 { top:calc(50% + 53px);  width:15px; background:rgba(255,255,255,.30); }
+  .ticks i.t2 { top:calc(50% + 89px);  width:11px; background:rgba(255,255,255,.22); }
+  .ticks i.t3 { top:calc(50% + 112px); width:8px;  background:rgba(255,255,255,.14); }
+
+  /* 液位覆盖的那一段（圆点以上）刻度跟着变暖，和液位同一套色 */
+  .card.filled .ticks i.t-3{ background:rgba(246,212,140,.62); }
+  .card.filled .ticks i.t-2{ background:rgba(240,170,110,.42); }
+  .card.filled .ticks i.t-1{ background:rgba(255,205,170,.30); }
+
+  /* 刻度带和数字带都要能整体位移（滚动），遮罩留在外层不动 */
+  .ticks-mask{
+    position:absolute; inset:0; z-index:2; pointer-events:none;
+    -webkit-mask-image:linear-gradient(to bottom, transparent 0, #000 22%, #000 78%, transparent 100%);
+            mask-image:linear-gradient(to bottom, transparent 0, #000 22%, #000 78%, transparent 100%);
+  }
+  .band{
+    position:absolute; inset:0;
+    transition:transform .15s cubic-bezier(.22,.7,.25,1);
+    /* 不要写 will-change:transform —— 它会把这个带提升成独立合成层，
+       滚动时四个圆角就会露出直角（用户报的"多余的四个角"）。 */
+  }
+  /* 滚动过程中：外围两格淡出（槽位间距是透视压缩的，位移一格会错位，遮掉最干净） */
+  .card.rolling .num.s-3, .card.rolling .num.s-2,
+  .card.rolling .num.s2,  .card.rolling .num.s3,
+  .card.rolling .ticks i.t-3, .card.rolling .ticks i.t-2,
+  .card.rolling .ticks i.t2,  .card.rolling .ticks i.t3{ opacity:0; }
+
+  /* 中心指示：小圆点 + 红线 */
+  /* 圆点和红条也跟透明度走 */
+  .ind{ position:absolute; left:0; top:50%; width:100%; height:0; z-index:3; pointer-events:none;
+        opacity:var(--a); }
+  .ind .dot{
+    position:absolute; left:89px; top:-9.5px; width:19px; height:19px; border-radius:50%;
+    background:radial-gradient(circle at 38% 34%, #ffffff 0%, #f0f0f0 52%, #b5b5b5 100%);
+    box-shadow:0 0 0 4px rgba(255,255,255,.07), 0 0 16px rgba(255,255,255,.30), 0 1px 3px rgba(0,0,0,.6);
+  }
+  .ind .dot::after{
+    content:""; position:absolute; left:50%; top:50%; width:6px; height:6px; margin:-3px 0 0 -3px;
+    border-radius:50%; background:#FF4D4D;
+    box-shadow:0 0 6px rgba(255,77,77,.9);
+  }
+  .ind .bar{
+    position:absolute; left:110px; top:-2.5px; width:54px; height:5px; border-radius:2.5px;
+    /* 实色 + 遮罩渐隐：用颜色透明度做渐隐时，末端会混成脏灰、还会把底下的刻度透出来；
+       遮罩只影响"画不画"，颜色始终是纯红，边缘干净。 */
+    background:#FF4D4D;
+    -webkit-mask-image:linear-gradient(90deg, #000 0%, #000 46%, rgba(0,0,0,.62) 74%, transparent 100%);
+            mask-image:linear-gradient(90deg, #000 0%, #000 46%, rgba(0,0,0,.62) 74%, transparent 100%);
+    box-shadow:0 0 10px rgba(255,70,70,.42), 0 0 26px 4px rgba(255,60,60,.10);
+    transition:opacity .2s ease;
+  }
+
+  /* ============ 右下：播放 / 暂停 ============ */
+  .play{
+    position:relative; z-index:4;
+    width:42px; height:42px; padding:0; border:0; border-radius:50%;
+    background:rgba(255,255,255,.035);
+    box-shadow:inset 0 0 0 2px rgba(255,255,255,.22), 0 0 26px rgba(0,0,0,.35);
+    color:rgba(255,255,255,.9); cursor:pointer;
+    display:grid; place-items:center;
+    transition:background .16s ease, box-shadow .16s ease, transform .1s ease;
+  }
+  .play:hover{ background:rgba(255,255,255,.07); box-shadow:inset 0 0 0 1.5px rgba(255,255,255,.26); }
+  .play:hover svg{ color:#fff; }
+  .play:active{ transform:scale(.95); }
+  .play svg{ width:18px; height:18px; display:none; color:#8C8C8C; }
+  .play svg.on{ display:block; }
+  /* 跑起来之后按钮换成红色强调（参考图里暂停是红的） */
+  .card.run .play{ box-shadow:inset 0 0 0 2px rgba(255,90,90,.55); color:#FF7A6A; }
+  .card.run .play svg{ color:#FF7A6A; }
+
+  /* 左下：重置（只有跑起来/暂停时才出现） */
+  /* 底部一排按钮：以卡片中线左右对称，两个同尺寸 */
+  .btns{
+    position:absolute; left:0; right:0; bottom:20px; z-index:4;
+    display:flex; align-items:center; gap:26px;
+    /* 设定态：只有播放键，回到右下角（原来顺手的位置）
+       运行态：重置 + 暂停两键，底部居中对称 */
+    justify-content:flex-end; padding-right:20px;
+  }
+  .card.run .btns{ justify-content:center; padding-right:0; }
+  .reset{
+    position:relative; z-index:4;
+    width:42px; height:42px; padding:0; border:0; border-radius:50%;
+    background:rgba(255,255,255,.025);
+    box-shadow:inset 0 0 0 1.5px rgba(255,255,255,.12);
+    color:rgba(255,255,255,.45); cursor:pointer;
+    display:none; place-items:center;
+    transition:background .15s ease, color .15s ease;
+  }
+  .card.run .reset{ display:grid; }
+  .reset:hover{ background:rgba(255,255,255,.07); color:#fff; }
+  .reset svg{ width:16px; height:16px; }
+  /* 重置的两段确认：第一下之后变红，提示"再点一次" */
+  .reset.arm{
+    color:#FF7A6A;
+    box-shadow:inset 0 0 0 2px rgba(255,90,90,.65);
+    background:rgba(255,90,90,.12);
+  }
+
+  /* ============ 底部提示 ============ */
+  /* 左上角单位徽标：点一下在 分 / 秒 之间切换 */
+  .unit{
+    /* 放右上角：左边是数字列、下边是按钮，只有右上这块是空的 */
+    position:absolute; right:12px; top:9px; z-index:7;
+    padding:2px 7px; border-radius:7px;
+    font-size:10px; letter-spacing:.5px;
+    color:rgba(255,255,255,.55);
+    background:rgba(255,255,255,.06);
+    box-shadow:inset 0 0 0 1px rgba(255,255,255,.12);
+    cursor:pointer; user-select:none;
+    transition:background .15s ease, color .15s ease;
+  }
+  .unit:hover{ background:rgba(255,255,255,.12); color:#fff; }
+  body.light .unit{ color:rgba(0,0,0,.55); background:rgba(0,0,0,.05); box-shadow:inset 0 0 0 1px rgba(0,0,0,.10); }
+  body.light .unit:hover{ background:rgba(0,0,0,.10); color:#111; }
+
+  /* 预设胶囊：鼠标移到卡片上才浮出来（空态一直显示，否则新人找不到） */
+  .presets{
+    /* 右上角偏左一点，给单位徽标让出位置 */
+    position:absolute; left:68px; right:46px; top:9px; z-index:6;
+    display:flex; gap:5px; justify-content:flex-end;
+    opacity:0; transform:translateY(-3px); pointer-events:none;
+    transition:opacity .16s ease, transform .16s ease;
+  }
+  .card:hover .presets,
+  .card.empty .presets{ opacity:1; transform:none; pointer-events:auto; }
+  .card.run .presets, .card.pause .presets, .card.alarm .presets{ opacity:0; pointer-events:none; }
+  .presets button{
+    padding:2px 7px; border:0; border-radius:7px;
+    font:400 10px/1.5 inherit;
+    color:rgba(255,255,255,.62);
+    background:rgba(255,255,255,.06);
+    box-shadow:inset 0 0 0 1px rgba(255,255,255,.12);
+    cursor:pointer;
+    transition:background .14s ease, color .14s ease;
+  }
+  .presets button:hover{ background:rgba(255,255,255,.16); color:#fff; }
+  body.light .presets button{ color:rgba(0,0,0,.55); background:rgba(0,0,0,.05); box-shadow:inset 0 0 0 1px rgba(0,0,0,.10); }
+  body.light .presets button:hover{ background:rgba(0,0,0,.12); color:#111; }
+
+  /* 首用引导：一行小字，操作一次或 10 秒后消失 */
+  .hint{
+    /* 贴底一行：左右各留 14，保证不折行；高度落在按钮下方那条窄带里 */
+    position:absolute; left:14px; right:14px; bottom:10px; z-index:6;
+    text-align:center; font-size:9px; line-height:1.3; white-space:nowrap;
+    color:rgba(255,255,255,.40);
+    opacity:0; transition:opacity .3s ease; pointer-events:none;
+  }
+  .hint.on{ opacity:1; }
+  body.light .hint{ color:rgba(0,0,0,.42); }
+
+  /* 番茄钟阶段标签：运行/暂停/到点时显示在顶部中央（设定态 presets 占着顶部，隐藏） */
+  .phase{
+    position:absolute; left:0; right:0; top:12px; z-index:6;
+    text-align:center; font-size:11px; letter-spacing:1.2px; white-space:nowrap;
+    color:rgba(255,255,255,.55); pointer-events:none;
+    opacity:0; transition:opacity .22s ease, color .22s ease;
+  }
+  .card.pomodoro.run .phase, .card.pomodoro.pause .phase, .card.pomodoro.alarm .phase{ opacity:1; }
+  body.light .phase{ color:rgba(0,0,0,.5); }
+  /* 休息阶段换成绿色，长休息换成蓝色，一眼区分 */
+  .card.phase-break .phase{ color:#7FD3A0; }
+  body.light .card.phase-break .phase{ color:#2E8B57; }
+  .card.phase-long .phase{ color:#8FB8E8; }
+  body.light .card.phase-long .phase{ color:#3A6EA5; }
+
+/* 简洁界面左上角的返回箭头：点了回到设定界面 */
+  /* 中间上方的图钉：悬停出现，点了钉在最前（再点取消） */
+  /* ===== 横版（320x140）=====
+     顶部：← / 切换 / × 三个按钮常显；下面一行：重置 · 数字 · 播放 */
+  /* 卡片缩到 213x93 后：横向内边距收到 8，数字与按钮中心都落在 52px。
+     数字 46px 时文字宽 113px，可用 117px —— 刚好放得下（再小就会压到按钮）。 */
+  /* 平时没有按钮，数字可以放大、位置略高（不然一张空卡很空）；
+     鼠标移上去按钮出现，数字缩回 46px 让位。58px 时文字宽约 142px，
+     仍小于卡片 213，不会溢出。 */
+  body.wide .card .num.s0{
+    top:46px; font-size:58px; letter-spacing:-1px;
+    transition:top .16s ease, font-size .16s ease;
+  }
+  body.wide .card:not(.alarm):hover .num.s0{ top:52px; font-size:46px; }
+  /* 横版运行中默认只有数字；鼠标移上去才出现两个按钮；
+     到点之后按钮常显（这时用户要做的就是"再来一次/继续"） */
+  body.wide .card .btns{
+    inset:0; padding:0 8px 0;
+    justify-content:space-between; align-items:center;
+    pointer-events:none;
+    opacity:0; transition:opacity .16s ease;
+  }
+  body.wide .card .btns .play,
+  body.wide .card .btns .reset{ pointer-events:none; }
+  body.wide .card:hover .btns,
+  body.wide .card.alarm .btns{ opacity:1; }
+  body.wide .card:hover .btns .play,
+  body.wide .card:hover .btns .reset,
+  body.wide .card.alarm .btns .play,
+  body.wide .card.alarm .btns .reset{ pointer-events:auto; }
+  body.wide .card .play, body.wide .card .reset{ width:40px; height:40px; margin-top:11px; }
+  body.wide .card .play svg, body.wide .card .reset svg{ width:17px; height:17px; }
+  /* 顶部三个也是"挪上去才出现"，和方形里一致 */
+  body.wide .card .back, body.wide .card .rot, body.wide .card .xclose{
+    display:grid; opacity:0; pointer-events:none; transform:none;
+    top:2px; width:26px; height:26px;
+    transition:opacity .16s ease;
+  }
+  body.wide .card:hover .back,
+  body.wide .card:hover .rot,
+  body.wide .card:hover .xclose{ opacity:1; pointer-events:auto; }
+  body.wide .card .back{ left:8px; }
+  body.wide .card .rot{ left:50%; transform:translateX(-50%); }
+  body.wide .card .xclose{ right:8px; }
+  body.wide .card .since{ top:auto; bottom:2px; font-size:8.5px; }
+
+  /* 横版"到点"状态：数字退居次要，两个按钮放大当主角
+     （这时用户要做的动作是"再来一次 / 继续"，而不是读时间） */
+  body.wide .card.alarm .num.s0{ font-size:30px; top:52px; opacity:.5; }
+  body.wide .card.alarm .play,
+  body.wide .card.alarm .reset{ width:54px; height:54px; margin-top:4px; }
+  body.wide .card.alarm .play svg,
+  body.wide .card.alarm .reset svg{ width:22px; height:22px; }
+
+  .rot{
+    pointer-events:none;      /* 不可见时别响应鼠标，否则会弹 title 提示 */
+    position:absolute; left:50%; top:11px; z-index:8;
+    width:26px; height:26px; padding:0; border:0; border-radius:50%;
+    background:rgba(255,255,255,.08);
+    color:rgba(255,255,255,.72);
+    display:grid; place-items:center;
+    cursor:pointer;
+    opacity:0;
+    transform:translateX(-50%) translateY(-3px);
+    transition:opacity .16s ease, transform .16s ease, background .16s ease, color .16s ease;
+  }
+  .rot svg{ width:13px; height:13px; }
+  /* 只有鼠标挪上去才出现（钉住了也一样，只是变红做提示） */
+  .card.mini:hover .rot{ opacity:1; transform:translateX(-50%); pointer-events:auto; }
+  .rot:hover{ background:rgba(255,255,255,.18); color:#fff; }
+  body.light .rot{ background:rgba(0,0,0,.07); color:rgba(0,0,0,.55); }
+  body.light .rot:hover{ background:rgba(0,0,0,.14); color:#111; }
+
+  .back{
+    /* 设定界面里它不该存在：opacity:0 的元素照样能被悬停、照样弹 title 提示，
+       所以必须把命中一起关掉（pointer-events:none），只在简洁界面才恢复。 */
+    pointer-events:none;
+    position:absolute; left:12px; top:12px; z-index:8;
+    width:26px; height:26px; padding:0; border:0; border-radius:50%;
+    background:rgba(255,255,255,.08);
+    color:rgba(255,255,255,.75);
+    display:grid; place-items:center;
+    cursor:pointer;
+    opacity:0; transform:translateX(-3px);
+    transition:opacity .16s ease, transform .16s ease, background .16s ease;
+  }
+  .back svg{ width:13px; height:13px; }
+  .card.mini:hover .back{ opacity:1; transform:none; pointer-events:auto; }
+  .back:hover{ background:rgba(255,255,255,.18); color:#fff; }
+  body.light .back{ background:rgba(0,0,0,.07); color:rgba(0,0,0,.6); }
+  body.light .back:hover{ background:rgba(0,0,0,.14); color:#111; }
+
+  /* 悬停出现的小叉：不用再右键找"退出" */
+  .xclose{
+    /* 右/上等距 = 落在 45° 对角线上，和圆角弧线同一条线 */
+    position:absolute; right:13px; top:13px; z-index:8;
+    width:22px; height:22px; padding:0; border:0; border-radius:50%;
+    background:rgba(255,255,255,.08);
+    color:rgba(255,255,255,.7);
+    display:grid; place-items:center;
+    cursor:pointer;
+    opacity:0; transform:scale(.9);
+    transition:opacity .16s ease, transform .16s ease, background .16s ease, color .16s ease;
+  }
+  .xclose svg{ width:11px; height:11px; }
+  .card:hover .xclose{ opacity:1; transform:none; }
+  .xclose:hover{ background:rgba(255,90,90,.85); color:#fff; }
+  /* 鼠标压到右上角缩放热区时把叉藏起来，否则角就拖不动了 */
+  body.light .xclose{ background:rgba(0,0,0,.07); color:rgba(0,0,0,.55); }
+  body.light .xclose:hover{ background:#E8564E; color:#fff; }
+
+  /* 四角缩放热区：平时看不见，鼠标上来给一点提示 */
+  .rz{
+    /* 34x34：22 太小，圆角半径 30 会把外侧削掉，剩下能点的只有一小块。
+       ★ z-index 必须压过所有内容层：底部按钮条 .btns 是 9，热区原来是 7，
+       结果按在下方两个角上命中的是按钮条 → 变成"拖窗口"而不是"缩放"
+       （用户报的"尺寸调不了，只有内容在变"）。 */
+    position:absolute; width:34px; height:34px; z-index:30;
+    cursor:nwse-resize;
+  }
+  /* 顶部两个角不做缩放：那一排是 ← / 图钉 / ×，热区压上去太容易误触
+     （用户反馈"顶部的区域就不要有缩放"）。只留底部两个角。 */
+  .rz-tl, .rz-tr{ display:none; }
+  .rz-br{ right:0; bottom:0; }
+  .rz-bl{ left:0; bottom:0; cursor:nesw-resize; }
+  /* 角上的小弧线提示（只在悬停时出现） */
+  .rz::after{
+    content:""; position:absolute; width:10px; height:10px;
+    opacity:0; transition:opacity .15s ease;
+  }
+  .rz-tl::after{ left:3px; top:3px; border-left:2px solid rgba(255,255,255,.55); border-top:2px solid rgba(255,255,255,.55); border-radius:3px 0 0 0; }
+  .rz-br::after{ right:3px; bottom:3px; border-right:2px solid rgba(255,255,255,.55); border-bottom:2px solid rgba(255,255,255,.55); border-radius:0 0 3px 0; }
+  .rz-tr::after{ right:3px; top:3px; border-right:2px solid rgba(255,255,255,.55); border-top:2px solid rgba(255,255,255,.55); border-radius:0 3px 0 0; }
+  .rz-bl::after{ left:3px; bottom:3px; border-left:2px solid rgba(255,255,255,.55); border-bottom:2px solid rgba(255,255,255,.55); border-radius:0 0 0 3px; }
+  .rz:hover::after{ opacity:1; }
+  body.light .rz::after{ border-color:rgba(0,0,0,.35); }
+
+  /* 到点之后："已过 3 分" —— 声音停了以后，这是唯一还在动的信息 */
+  .since{
+    position:absolute; left:0; right:0; top:64%; z-index:5;
+    text-align:center; font-size:13px; letter-spacing:.5px; font-weight:500;
+    color:rgba(255,150,140,.9);
+    opacity:0; transition:opacity .25s ease;
+    pointer-events:none;
+  }
+  .card.alarm .since{ opacity:1; }
+  body.light .since{ color:#C0392B; }
+
+  /* 一句小提示（超范围 / 看不懂） */
+  .tip{
+    position:absolute; left:0; right:0; bottom:8px; z-index:9;
+    text-align:center; font-size:10px; color:#FFB4A8;
+    opacity:0; transform:translateY(4px);
+    transition:opacity .18s ease, transform .18s ease;
+    pointer-events:none;
+  }
+  .tip.on{ opacity:1; transform:none; }
+  body.light .tip{ color:#C0392B; }
+
+  /* ============ 运行态：大数字换成 mm:ss ============ */
+  .card.run .num:not(.s0){ opacity:0; }
+  /* 运行态：界面不变（滚轮 + 刻度 + 竖线 + 红条都留着），
+     只有中心那个数字变成 mm:ss 往下走 —— 不跳界面，看着才连贯。 */
+  .card.run .num.s0{
+    /* 竖线在 97px 处，mm:ss 必须整个待在它左边：28px 时 "14:59" 约 64px 宽 */
+    left:16px; right:auto; text-align:left; top:50%;
+    font-size:28px; font-weight:500; letter-spacing:0;
+    text-shadow:none;
+  }
+  .card.run .num.s0.wide{ font-size:28px; }   /* mm:ss 本来就是长的，别再降字号 */
+
+  /* 简洁界面（点停止才进来）：只留一个大数字 */
+  .card.mini .ruler,
+  .card.mini .ruler-fill,
+  .card.mini .ind,
+  .card.mini .ticks,
+  .card.mini .num:not(.s0){ opacity:0; }
+  /* 数字在 .wheel 里（只有 172 宽），不撑满整卡就居中不了 */
+  .card.mini .wheel{ width:100%; }
+  .card.mini .num.s0{
+    left:0; right:0; text-align:center; top:44%;
+    /* 平时按钮不显示，数字放到最大；鼠标移上去（或到点）再缩回 70 让位 */
+    font-size:78px; font-weight:600; letter-spacing:-1.5px;
+    opacity:1;
+    text-shadow:0 0 30px rgba(255,255,255,.32), 0 0 70px rgba(255,255,255,.12);
+    transition:font-size .16s ease;
+  }
+  .card.mini:hover .num.s0,
+  .card.mini.alarm .num.s0{ font-size:70px; }
+  body.light .card.mini .num.s0{ text-shadow:none; }
+
+  /* 方形倒计时：按钮默认不显示（只有数字），悬停或到点才出现 */
+  .card.mini .btns{ opacity:0; transition:opacity .16s ease; }
+  .card.mini .btns .play,
+  .card.mini .btns .reset{ pointer-events:none; }
+  .card.mini:hover .btns,
+  .card.mini.alarm .btns{ opacity:1; }
+  .card.mini:hover .btns .play,
+  .card.mini:hover .btns .reset,
+  .card.mini.alarm .btns .play,
+  .card.mini.alarm .btns .reset{ pointer-events:auto; }
+
+  /* 运行态的按钮：暂停是红色实心，重置是深灰实心（参考图） */
+  .card.run .play{
+    /* 和"再来一次"同尺寸（方形 42 / 横版 40），只是靠颜色区分；
+       红色原来太抢眼（还带一圈强光晕，看着比另一个大），把不透明度和光晕都压下来。 */
+    background:rgba(232,86,78,.86);
+    box-shadow:0 3px 10px rgba(232,86,78,.20), inset 0 1px 0 rgba(255,255,255,.16);
+    color:rgba(255,255,255,.95);
+  }
+  .card.run .play:hover{ background:#F0645C; }
+  .card.run .play svg{ color:#fff; }
+  .card.run .reset{
+    background:rgba(255,255,255,.10);
+    box-shadow:inset 0 0 0 1px rgba(255,255,255,.16), 0 4px 12px rgba(0,0,0,.25);
+    color:rgba(255,255,255,.92);
+  }
+  .card.run .reset:hover{ background:rgba(255,255,255,.18); }
+  body.light .card.run .reset{
+    background:rgba(0,0,0,.07);
+    box-shadow:inset 0 0 0 1px rgba(0,0,0,.10);
+    color:#333;
+  }
+  body.scrubbing{ cursor:ns-resize; }
+  /* 超时态：同一位置放一句"超时 N 分"，字号要小 */
+  .card.over .num.s0{ font-size:26px; font-weight:400; letter-spacing:0; }
+
+  /* ============ 到点：整卡红闪 ============ */
+  @keyframes flash{
+    0%,100%{ box-shadow:inset 0 0 0 1px rgba(255,90,90,.10); background-color:transparent; }
+    50%{ box-shadow:inset 0 0 0 2px rgba(255,90,90,.85), 0 0 26px rgba(255,90,90,.35); background-color:rgba(255,90,90,.10); }
+  }
+  /* 到点：边框加粗成明显的红环，再配合呼吸闪（用户要求"边框画粗一点"） */
+  /* 暂停：数字明显变淡（配右下暂停键的红色，一眼看出"停住了"） */
+  .card.pause .num.s0{ opacity:.42; }
+  /* 注意：这里不能再写 .card.pause .ruler-fill{opacity:.5} ——
+     它在运行态规则之后，会把 .card.run .ruler-fill{opacity:0} 覆盖掉，
+     暂停一下就看见红线又冒出来了（用户报的 bug）。 */
+
+  .card.alarm{
+    animation:flash 1s ease-in-out infinite;
+    box-shadow:inset 0 0 0 5px rgba(255,70,70,.85), 0 0 22px rgba(255,60,60,.45);
+  }
+  @keyframes flash2{
+    0%,100%{ box-shadow:inset 0 0 0 5px rgba(255,70,70,.9), 0 0 18px rgba(255,60,60,.35); }
+    50%    { box-shadow:inset 0 0 0 8px rgba(255,60,60,.55), 0 0 34px rgba(255,50,50,.55); }
+  }
+  .card.alarm{ animation:flash2 1s ease-in-out infinite; }
+  .card.alarm .num.big{ color:var(--red); }
+
+  /* ============ 双击改时间：就地输入框 ============ */
+  .edit{
+    position:absolute; left:14px; top:50%; transform:translateY(-50%);
+    /* 原来 128x48、字号 30：只能显示两三个字符，输 3:30 直接溢出看不见 */
+    width:180px; height:56px; z-index:6;
+    padding:0 12px; border:0; border-radius:10px;
+    /* 不透明：半透明时圆点和红条会透在输入框里，看着像坏了一层 */
+    background:#12161F;
+    box-shadow:inset 0 0 0 1.5px rgba(255,255,255,.42), 0 6px 18px rgba(0,0,0,.45);
+    /* 注意：不能写 font:500 34px/1 inherit —— "inherit" 不是合法字体族，
+       整条简写会被丢弃，输入框就退回浏览器默认的 13px（看不清也点不准）。 */
+    color:#fff; font-size:34px; font-weight:500; line-height:1; font-family:inherit;
+    font-variant-numeric:tabular-nums;
+    outline:none; display:none;
+  }
+  .edit.on{ display:block; }
+
+  /* ============ 外观面板（右键菜单进来） ============ */
+  .panel{
+    /* z-index 要压过 .num（它有 will-change:transform，会自己开合成层） */
+    position:absolute; left:0; right:0; bottom:0; z-index:20;
+    padding:12px 16px 14px;
+    /* 必须完全不透明：底下是 72px 的白数字，哪怕 1.5% 也会透出来像重影 */
+    background:#0E1219;
+    box-shadow:0 -1px 0 rgba(255,255,255,.10), 0 -12px 28px rgba(0,0,0,.4);
+    display:none;
+  }
+  .panel.on{ display:block; }
+  .panel h4{ margin:0 0 8px; font-size:11px; font-weight:600; color:var(--ink2); letter-spacing:.3px; }
+  .row{ display:flex; align-items:center; gap:10px; margin-bottom:7px; font-size:11.5px; color:var(--ink2); }
+  .row span{ flex:0 0 44px; }
+  .row b{ flex:0 0 34px; text-align:right; font-weight:500; color:var(--ink3); font-variant-numeric:tabular-nums; }
+  .row input[type=range]{ flex:1 1 auto; min-width:0; accent-color:#8ea0c4; height:16px; }
+  .panel .close{ margin-top:2px; font-size:11px; color:var(--ink3); text-align:right; cursor:pointer; }
+
+  /* 外观面板：压成一行 + 半透明带模糊 —— 调透明度时能看见卡片本身的效果 */
+  .panel.look{
+    padding:8px 24px 8px 9px;
+    display:flex; gap:8px; align-items:center;
+    background:rgba(12,16,24,.62);
+    -webkit-backdrop-filter:blur(10px) saturate(1.15);
+            backdrop-filter:blur(10px) saturate(1.15);
+    box-shadow:0 -1px 0 rgba(255,255,255,.08);
+  }
+  .panel.look .row{ flex:1 1 0; min-width:0; height:24px; gap:3px; }
+  .panel.look .row span{ flex:0 0 30px; font-size:9px; white-space:nowrap; }
+  .panel.look .row input[type=range]{ flex:1 1 auto; min-width:0; }
+  .panel.look .row b{ flex:0 0 27px; font-size:9px; text-align:right; }
+  /* 收起放到面板右侧当一个小叉，不占一行 */
+  .panel.look .close{
+    position:absolute; right:6px; top:50%; transform:translateY(-50%);
+    margin:0; font-size:0; width:16px; height:16px; border-radius:50%;
+    display:grid; place-items:center;
+    color:rgba(255,255,255,.55);
+  }
+  .panel.look .close::after{ content:"×"; font-size:14px; line-height:1; }
+  .panel.look .close:hover{ background:rgba(255,255,255,.14); color:#fff; }
+  body.light .panel.look .close{ color:rgba(0,0,0,.5); }
+  body.light .panel.look{
+    background:rgba(250,250,250,.72);
+    box-shadow:0 -1px 0 rgba(0,0,0,.06);
+  }
+  /* 提示音面板：每行鼠标移上去就试听（原生右键菜单没有 hover，只能做成卡片内面板） */
+  .sndlist{ display:flex; flex-direction:column; gap:2px; margin:4px 0 6px; }
+  .sndrow{
+    display:flex; align-items:center; gap:7px;
+    padding:5px 7px; border-radius:7px;
+    font-size:11px; color:rgba(255,255,255,.72);
+    cursor:pointer;
+    transition:background .12s ease, color .12s ease;
+  }
+  .sndrow:hover{ background:rgba(255,255,255,.10); color:#fff; }
+  .sndrow .dotm{
+    flex:0 0 5px; width:5px; height:5px; border-radius:50%;
+    background:transparent; box-shadow:inset 0 0 0 1px rgba(255,255,255,.28);
+  }
+  .sndrow.on{ color:#fff; }
+  .sndrow.on .dotm{ background:#FF5A5A; box-shadow:0 0 6px rgba(255,90,90,.8); }
+  body.light .sndrow{ color:rgba(0,0,0,.68); }
+  body.light .sndrow:hover{ background:rgba(0,0,0,.07); color:#111; }
+  body.light .sndrow.on{ color:#111; }
+  body.light .sndrow .dotm{ box-shadow:inset 0 0 0 1px rgba(0,0,0,.25); }
+  .panel .close:hover{ color:#fff; }
+
+  /* ================= 日间（浅色）主题 =================
+     只做覆盖，不改上面那套深色规则：body 上挂 .light 才生效，
+     夜间模式一个字节都不受影响。 */
+  body.light{ color:#111; }
+
+  body.light .card{
+    background-image:linear-gradient(178deg,
+      color-mix(in srgb, #FFFFFF calc(var(--a) * 100%), transparent) 0%,
+      color-mix(in srgb, #F8F8F8 calc(var(--a) * 100%), transparent) 46%,
+      color-mix(in srgb, #EFEFEF calc(var(--a) * 100%), transparent) 100%);
+    box-shadow:
+      inset 0 1px 0 rgba(255,255,255,.95),
+      inset 0 0 0 1px rgba(0,0,0,.05),
+      0 6px 22px rgba(0,0,0,.10);
+  }
+  body.light .card::after{ background:none; }
+
+  body.light .num.s-3{ color:#C9C9C9; }
+  body.light .num.s-2{ color:#AFAFAF; }
+  body.light .num.s-1{ color:#8A8A8A; }
+  body.light .num.s0 { color:#111; text-shadow:none; }
+
+  body.light .ruler{
+    background:linear-gradient(to bottom,
+      rgba(0,0,0,.05) 0%,
+      rgba(0,0,0,.10) 24%,
+      rgba(0,0,0,.15) 50%,
+      rgba(0,0,0,.10) 76%,
+      rgba(0,0,0,.05) 100%);
+    box-shadow:1px 0 0 rgba(255,255,255,.85);
+  }
+
+  body.light .ticks i.t-3{ background:rgba(0,0,0,.10); }
+  body.light .ticks i.t-2{ background:rgba(0,0,0,.16); }
+  body.light .ticks i.t-1{ background:rgba(0,0,0,.22); }
+  body.light .ticks i.t0 { background:rgba(0,0,0,.28); }
+  body.light .ticks i.t1 { background:rgba(0,0,0,.22); }
+  body.light .ticks i.t2 { background:rgba(0,0,0,.16); }
+  body.light .ticks i.t3 { background:rgba(0,0,0,.10); }
+  body.light .card.filled .ticks i.t-3{ background:rgba(233,169,78,.90); }
+  body.light .card.filled .ticks i.t-2{ background:rgba(233,169,78,.55); }
+  body.light .card.filled .ticks i.t-1{ background:rgba(233,169,78,.32); }
+
+  body.light .ruler-fill{
+    background:linear-gradient(to bottom, #F2B75E 0%, #EC9A5E 45%, #E4623F 100%);
+    box-shadow:0 0 8px rgba(232,140,80,.30);
+  }
+
+  body.light .ind .dot{
+    background:radial-gradient(circle at 38% 34%, #fff 0%, #fff 55%, #EFEFEF 100%);
+    box-shadow:0 0 0 3px rgba(0,0,0,.045), 0 1px 4px rgba(0,0,0,.18);
+  }
+
+  body.light .ind .bar{
+    background:#FF3B30;
+    box-shadow:0 0 9px rgba(255,70,60,.30), 0 0 22px 3px rgba(255,70,60,.07);
+  }
+
+  body.light .play{
+    background:rgba(0,0,0,.015);
+    box-shadow:inset 0 0 0 2px rgba(0,0,0,.10);
+    color:#B4B4B4;
+  }
+  body.light .play svg{ color:#A8A8A8; }
+  body.light .play:hover{ background:rgba(0,0,0,.05); box-shadow:inset 0 0 0 2px rgba(0,0,0,.18); }
+  body.light .play:hover svg{ color:#666; }
+  body.light .reset{
+    background:rgba(0,0,0,.015);
+    box-shadow:inset 0 0 0 1.5px rgba(0,0,0,.08);
+    color:rgba(0,0,0,.35);
+  }
+  body.light .reset:hover{ background:rgba(0,0,0,.05); color:#333; }
+
+  body.light .card.run .play{ box-shadow:inset 0 0 0 2px rgba(255,90,80,.55); }
+  body.light .card.run .play svg{ color:#FF6B5E; }
+
+  body.light .edit{
+    background:#FFFFFF;
+    box-shadow:inset 0 0 0 1.5px rgba(0,0,0,.22);
+    color:#111;
+  }
+
+  body.light .panel{
+    background:#FAFAFA;
+    box-shadow:0 -1px 0 rgba(0,0,0,.06), 0 -12px 28px rgba(0,0,0,.10);
+  }
+  body.light .panel h4{ color:#111; }
+  body.light .panel .row span{ color:rgba(0,0,0,.6); }
+  body.light .panel .row b{ color:rgba(0,0,0,.45); }
+  body.light .panel .close{ color:rgba(0,0,0,.4); }
+  body.light .panel .close:hover{ color:#111; }
+</style>
+</head>
+<body>
+<div id="bd"></div>
+
+<div class="card" id="card">
+  <div class="ruler"></div>
+  <div class="ruler-fill" id="rulerFill"></div>
+  <div class="ticks-mask">
+    <div class="band" id="tickBand">
+      <div class="ticks">
+        <i class="t-3"></i><i class="t-2"></i><i class="t-1"></i><i class="t0"></i>
+        <i class="t1"></i><i class="t2"></i><i class="t3"></i>
+      </div>
+    </div>
+  </div>
+
+  <div class="wheel" id="wheel">
+    <div class="band" id="numBand">
+      <div class="num s-3" id="nm3"></div>
+      <div class="num s-2" id="nm2"></div>
+      <div class="num s-1" id="nm1"></div>
+      <div class="num s0"  id="n0">0</div>
+      <div class="num s1"  id="np1"></div>
+      <div class="num s2"  id="np2"></div>
+      <div class="num s3"  id="np3"></div>
+    </div>
+  </div>
+
+  <div class="ind"><i class="dot"></i><i class="bar"></i></div>
+
+  <div class="phase" id="phase"></div>
+
+  <div class="hint" id="hint">滚轮调专注时长 · 双击输入</div>
+
+  <i class="rz rz-tl" data-c="tl"></i>
+  <i class="rz rz-tr" data-c="tr"></i>
+  <i class="rz rz-bl" data-c="bl"></i>
+  <i class="rz rz-br" data-c="br"></i>
+
+  <button class="rot" id="rot" title="横竖切换">
+    <!-- 横竖屏切换：竖块 + 横条 + 箭头 -->
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round">
+      <rect x="1.8" y="5.2" width="7.6" height="13.6" rx="2"/>
+      <rect x="13.4" y="9.4" width="8.8" height="5.2" rx="2"/>
+      <path d="M10.1 12h2.5"/>
+      <path d="M11.9 10.4l1.7 1.6-1.7 1.6"/>
+    </svg>
+  </button>
+
+  <button class="back" id="back" title="返回设定">
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round">
+      <path d="M15 5l-7 7 7 7"/>
+    </svg>
+  </button>
+
+  <button class="xclose" id="xclose" title="退出">
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round">
+      <path d="M6 6l12 12M18 6L6 18"/>
+    </svg>
+  </button>
+
+  <div class="since" id="since"></div>
+
+  <div class="tip" id="tip"></div>
+
+  <input class="edit" id="edit" maxlength="8" inputmode="text" spellcheck="false" autocomplete="off">
+
+  <div class="btns" id="btns">
+  <button class="reset" id="reset" title="再来一次">
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round">
+      <path d="M20.5 12a8.5 8.5 0 1 1-2.6-6.1"/><path d="M20.5 3.6v4.2h-4.2"/>
+    </svg>
+  </button>
+
+  <button class="play" id="play" title="开始 / 暂停">
+    <svg class="on" id="icoPlay" viewBox="0 0 24 24" fill="currentColor"><path d="M8 5.5v13l11-6.5z"/></svg>
+    <svg id="icoPause" viewBox="0 0 24 24" fill="currentColor"><rect x="7" y="5.5" width="3.4" height="13" rx="1.2"/><rect x="13.6" y="5.5" width="3.4" height="13" rx="1.2"/></svg>
+  </button>
+  </div>
+
+  <div class="panel snd" id="sndPanel">
+    <h4>提示音</h4>
+    <div class="sndlist" id="sndList"></div>
+    <div class="close" id="sndClose">收起</div>
+  </div>
+</div>
+
+<script>
+/* ================= preload 缺失时的兜底 =================
+   window.wgt 由 preload 注入。没注入时补一层空实现，最差退化成普通网页，
+   而不是整页脚本抛错、卡片变成静态 HTML（另两张卡踩过这个坑）。 */
+if (!window.wgt) {
+  const noop = () => {};
+  const on = () => noop;
+  window.wgt = {
+    acrylic: false,
+    dlayer: false,
+    close: noop, menu: noop, raise: noop, rest: noop, dragBegin: noop, dragEnd: noop,
+    imeBegin: noop, imeEnd: noop, done: noop,
+    backdropNow: () => Promise.resolve(null),
+    getLook: () => Promise.resolve(null),
+    setLook: () => Promise.resolve(true),
+    onBackdrop: on, onBdFull: on, onBdPos: on, onBdDragEnd: on, onShowLook: on, onPreset: on,
+    onImeText: on, onImeCommit: on, onImeCancel: on, onImeBlur: on,
+    onReset: on, onSkip: on, onHint: on, onTheme: on, theme: "dark",
+    setSound: noop, onShowSound: on, resizeBegin: noop, resizeEnd: noop,
+    getTop: () => Promise.resolve(false), toggleTop: noop, onTop: on, getLayout: () => Promise.resolve("full"), setLayout: noop, onLayout: on, onLayout: on, setLayout: noop,
+    editing: noop, onCommitEdit: on,
+    dismiss: noop, onResume: on, onDismiss: on,
+    getSound: () => Promise.resolve({ mute:false, loop:true, name:"a-dingdong" }),
+    onSound: on, onPreview: on,
+  };
+}
+
+/* ================= 日间 / 夜间 =================
+   主进程已经把"跟随系统 / 手动"解析成 light|dark，这里只负责换皮。
+   放在所有初始化之前：首帧就带上 .light，不会先闪一下深色。 */
+function applyTheme(t) {
+  document.body.classList.toggle("light", t === "light");
+}
+applyTheme((window.wgt && window.wgt.theme) || "dark");
+/* 贴进桌面层：让 #bd 快照铺满整窗，圆角外那圈显示成桌面本身（见 CSS 的 body.dlayer） */
+if (window.wgt && window.wgt.dlayer) document.body.classList.add("dlayer");
+if (window.wgt && window.wgt.onDlayer) window.wgt.onDlayer((v) => document.body.classList.toggle("dlayer", v));
+if (window.wgt && window.wgt.onTheme) window.wgt.onTheme(applyTheme);
+
+const $ = (id) => document.getElementById(id);
+const cardEl = $("card");
+
+/* ================= 状态（番茄钟） =================
+   mode: "idle"（待开始）| "run"（计时中）| "pause"（暂停，显示剩余）
+   phase: "work"（专注）| "break"（短休息）| "longBreak"（长休息）
+   round: 当前第几轮专注；doneCount: 已完成专注数
+   minutes: 当前阶段时长；remain: 剩余毫秒 */
+const MIN_MAX = 60;              /* 专注时长上限 60 */
+let unit = "min";                /* 兼容旧存档；番茄钟内部一律按分钟 */
+const KEY = "pomo_min_v1";
+
+/* 番茄钟配置（存 localStorage，卡片和设置浮窗共用） */
+const POMO_KEY = "pomo_cfg_v1";
+const POMO_DEFAULT = { workMin: 25, breakMin: 5, longBreakMin: 15, longEvery: 0, autoCycle: true };
+let pomo = { ...POMO_DEFAULT };
+try {
+  const raw = localStorage.getItem(POMO_KEY);
+  if (raw) {
+    const o = JSON.parse(raw) || {};
+    ["workMin", "breakMin", "longBreakMin", "longEvery"].forEach((k) => {
+      if (Number.isFinite(o[k])) pomo[k] = Math.max(0, Math.min(MIN_MAX, Math.round(o[k])));
+    });
+    if (typeof o.autoCycle === "boolean") pomo.autoCycle = o.autoCycle;
+  }
+} catch (e) {}
+function savePomo() {
+  try { localStorage.setItem(POMO_KEY, JSON.stringify(pomo)); } catch (e) {}
+  try { window.wgt.setPomo(pomo); } catch (e) {}
+}
+/* 主进程/设置浮窗推来的新配置 */
+function applyPomo(v) {
+  if (!v || typeof v !== "object") return;
+  ["workMin", "breakMin", "longBreakMin", "longEvery"].forEach((k) => {
+    if (Number.isFinite(v[k])) pomo[k] = Math.max(0, Math.min(MIN_MAX, Math.round(v[k])));
+  });
+  if (typeof v.autoCycle === "boolean") pomo.autoCycle = v.autoCycle;
+  /* 设定态下把显示同步到新的专注时长 */
+  if (mode !== "run" && mode !== "pause") {
+    minutes = phaseMinutes();
+    remain = minutes * 60000;
+    totalMs = remain;
+  }
+  render();
+}
+
+let pomoMode = "plain";  /* plain=普通倒计时（到点结束） | pomodoro=番茄钟循环 */
+let phase = "work";      /* work | break | longBreak */
+let round = 1;           /* 第几轮专注（1-based） */
+let doneCount = 0;       /* 已完成专注数 */
+
+function phaseMinutes() {
+  if (phase === "break") return pomo.breakMin;
+  if (phase === "longBreak") return pomo.longBreakMin;
+  return pomo.workMin;
+}
+
+let minutes = 25;        /* 普通倒计时的分钟数（默认 25） */
+let mode = "idle";
+let remain = 0;          /* 毫秒 */
+let endAt = 0;           /* 运行时的目标时间戳 */
+let raf = null;
+let alarmOn = false;
+
+try {
+  const raw = localStorage.getItem(KEY);
+  if (raw != null) {
+    const v = Number(raw);
+    if (Number.isFinite(v) && v > 0 && v <= MIN_MAX) minutes = Math.round(v);
+  }
+} catch (e) {}
+
+function saveUnit() {
+  try { localStorage.setItem("timer_unit_v1", unit); } catch (e) {}
+}
+function loadUnit() {
+  try {
+    const v = localStorage.getItem("timer_unit_v1");
+    if (v === "sec" || v === "min") unit = v;
+  } catch (e) {}
+}
+/* 当前值换算成秒（分钟模式要乘 60） */
+function totalSeconds() {
+  return unit === "sec" ? minutes : minutes * 60;
+}
+
+/* 滚轮的 7 个槽位：id + 相对当前值的偏移 */
+const SLOTS = [["nm3", -3], ["nm2", -2], ["nm1", -1], ["np1", 1], ["np2", 2], ["np3", 3]];
+
+const pad2 = (n) => String(n).padStart(2, "0");
+/* 输入框用：夹在 0–60 */
+const clampMin = (v) => Math.max(0, Math.min(MIN_MAX, Math.round(v * 10) / 10));
+/* 滚轮用：0–60 首尾相接（0 再往上就是 60），跟参考图一致 */
+const wrapMin = (v) => {
+  let n = v % (MIN_MAX + 1);
+  if (n < 0) n += MIN_MAX + 1;
+  return Math.round(n * 10) / 10;
+};
+
+/* ================= 滚动动画 =================
+   数字带和刻度带一起平移一格，到点后瞬间归位并换值。
+   槽位间距是透视压缩的（53 / 36 / 23），所以位移一格只有中心与相邻格是精确对齐的，
+   外围两格在滚动过程中淡出（.card.rolling），避免看到错位。
+   刻度带用同一个位移量，所以它和数字是"同一根尺子"，一起滚。 */
+const ROW_SHIFT = 53;                 /* 中心到相邻槽位的距离 */
+const SLOT_PX = ROW_SHIFT;            /* 拨轮一格的手感距离 */
+/* 液位顶端要停的位置 = 刻度槽位的实际 y（不是 53 的倍数） */
+const FILL_STEPS = [0, 53, 89, 112];
+let rollTimer = 0, rollNext = null, rollKeep = false;
+
+/* 连滚时 minutes 还没更新，取"正在滚向的那个值"当基准 */
+const curValue = () => (rollNext != null ? rollNext : minutes);
+
+function rollTo(dir, next, keepRemain) {
+  markHint();
+  $("sndPanel").classList.remove("on");
+  if (rollTimer) finishRoll();        /* 连滚：上一格立刻落定，不排队 */
+  rollNext = next;
+  rollKeep = !!keepRemain;
+  const dy = dir > 0 ? -ROW_SHIFT : ROW_SHIFT;
+  const band = $("numBand"), tick = $("tickBand");
+  cardEl.classList.add("rolling");
+  band.style.transition = "";
+  tick.style.transition = "";
+  band.style.transform = "translateY(" + dy + "px)";
+  tick.style.transform = "translateY(" + dy + "px)";
+  /* 液位不在这里拉伸：它的高度由 render() 按"格数"算，靠 CSS 的 height 过渡
+     跟上这 150ms —— 这样数字走一格、液位也正好跳一格，两边同拍。 */
+  rollTimer = setTimeout(finishRoll, 150);
+}
+
+function finishRoll() {
+  if (!rollTimer) return;
+  clearTimeout(rollTimer);
+  rollTimer = 0;
+  const band = $("numBand"), tick = $("tickBand");
+  /* 归位这一下必须没有过渡，否则会看到"滚上去又滚回来" */
+  band.style.transition = "none";
+  tick.style.transition = "none";
+  band.style.transform = "";
+  tick.style.transform = "";
+  void band.offsetHeight;             /* 强制回流，让上面的 none 立刻生效 */
+  band.style.transition = "";
+  tick.style.transition = "";
+  cardEl.classList.remove("rolling");
+  const next = rollNext, keep = rollKeep;
+  rollNext = null;
+  rollKeep = false;
+  if (next != null) setMinutes(next, keep);
+}
+
+/* ================= 渲染 ================= */
+function mmss(ms) {
+  const t = Math.max(0, Math.ceil(ms / 1000));
+  return pad2(Math.floor(t / 60)) + ":" + pad2(t % 60);
+}
+
+function label(v) {
+  /* 首尾相接：0 的上面是上限，上限的下面是 0 */
+  const n = wrapMin(v);
+  if (Number.isInteger(n)) return String(n);
+  /* 带秒的值（3.5 分钟）显示成 03:30，比 "3.5" 好读 */
+  if (unit === "sec") return String(Math.round(n));
+  const total = Math.round(n * 60);
+  return pad2(Math.floor(total / 60)) + ":" + pad2(total % 60);
+}
+
+function render() {
+  const n0 = $("n0");
+  /* 阶段标签只在番茄钟模式显示 */
+  const isPomo = pomoMode === "pomodoro";
+  cardEl.classList.toggle("pomodoro", isPomo);
+  cardEl.classList.toggle("phase-break", isPomo && phase === "break");
+  cardEl.classList.toggle("phase-long", isPomo && phase === "longBreak");
+  const phEl = $("phase");
+  if (phEl) {
+    phEl.textContent = isPomo
+      ? ((phase === "work" ? "专注" : (phase === "longBreak" ? "长休息" : "休息")) + " · 第 " + round + " 轮")
+      : "";
+  }
+  /* 设了时间才点亮液位（默认 0 分钟时整条竖线是灰的） */
+  cardEl.classList.toggle("filled", minutes > 0);
+  cardEl.classList.toggle("empty", minutes === 0 && mode !== "run" && mode !== "pause");
+  const t0 = label(minutes);
+  n0.classList.toggle("wide", t0.length >= 4);
+  if (mode === "run" || mode === "pause") {
+    cardEl.classList.add("run");
+    cardEl.classList.toggle("pause", mode === "pause");
+    cardEl.classList.toggle("mini",
+      view === "mini" || document.body.classList.contains("wide"));
+    n0.textContent = mmss(remain);
+    $("icoPlay").classList.toggle("on", mode === "pause");
+    $("icoPause").classList.toggle("on", mode === "run");
+  } else {
+    cardEl.classList.remove("run", "pause");
+    cardEl.classList.toggle("mini", document.body.classList.contains("wide"));
+    n0.textContent = label(minutes);
+    $("icoPlay").classList.add("on");
+    $("icoPause").classList.remove("on");
+  }
+  /* 液位高度：设定态要落在刻度格上，运行态按剩余比例。
+     刻度槽位是透视压缩的（53 / 89 / 112，顶边 120），不是 53 的倍数 ——
+     用"格数 x 53"算，第 2 格会差 17px，看着就是"没对齐"。 */
+  const half = cardEl.clientHeight / 2 || 120;
+  if (mode !== "run" && mode !== "pause") {
+    SLOTS.forEach(([id, off]) => { $(id).textContent = label(minutes + off); });
+    const step = Math.min(3, Math.floor(Math.max(0, minutes)));
+    $("rulerFill").style.height = Math.min(half, FILL_STEPS[step]) + "px";
+  } else {
+    const ratio = totalMs > 0 ? Math.max(0, Math.min(1, remain / totalMs)) : 0;
+    $("rulerFill").style.height = (ratio * half) + "px";
+  }
+  syncHeight();
+  ensureSquareWhenIdle();
+}
+
+/* 页面高度固定，这里只是让主进程知道"没变化"（贴桌面层时窗口尺寸由主进程定） */
+function syncHeight() {}
+
+/* ================= 设定 / 开始 / 暂停 ================= */
+/* 滚轮 / 双击调时间 = 普通倒计时模式（到点结束，不循环） */
+function setMinutes(v, keepRemain) {
+  minutes = clampMin(v);
+  pomoMode = "plain";
+  try { localStorage.setItem(KEY, String(minutes)); } catch (e) {}
+  if (!keepRemain) { remain = minutes * 60000; totalMs = remain; }
+  if (mode !== "run") mode = "idle";
+  stopAlarm();
+  render();
+  saveRun();
+}
+
+/* 右键「专注 N 分钟」= 进入番茄钟循环模式，选完直接开始专注 */
+function setPomodoro(workMin) {
+  clearTimeout(autoNextTimer);
+  autoNextTimer = 0;
+  if (raf) { cancelAnimationFrame(raf); raf = null; }
+  stopGuard();
+  stopAlarm();
+  pomoMode = "pomodoro";
+  phase = "work";
+  round = 1;
+  doneCount = 0;
+  pomo.workMin = Math.max(1, Math.min(MIN_MAX, Math.round(workMin)));
+  savePomo();
+  mode = "idle";
+  view = "set";
+  minutes = pomo.workMin;
+  remain = minutes * 60000;
+  totalMs = remain;
+  endAt = 0;
+  render();
+  saveRun();
+  start();
+}
+
+/* ================= 存档：让时间在睡眠 / 重启后仍然准 =================
+   只存"结束时间戳"（run）或"剩余毫秒"（pause），不存倒计时过程。
+   回来时按 Date.now() 重算，睡多久都不会漂。 */
+const RUN_KEY = "timer_run_v1";
+let totalMs = 0;              /* 本次设定的总时长，用来算进度比例 */
+/* 运行中保持"设定界面"（滚轮+刻度），点停止才切到"简洁界面"（只有大数字）。
+   view=set 设定界面 / view=mini 简洁界面。 */
+let view = "set";
+
+function saveRun() {
+  try {
+    localStorage.setItem(RUN_KEY, JSON.stringify({
+      mode, minutes, endAt, remain, totalMs, phase, round, doneCount, pomoMode,
+    }));
+  } catch (e) {}
+}
+
+function start() {
+  const m = pomoMode === "pomodoro" ? phaseMinutes() : minutes;
+  if (m <= 0) return;
+  minutes = m;
+  totalMs = m * 60000;
+  remain = totalMs;
+  endAt = Date.now() + remain;
+  mode = "run";
+  view = "mini";              /* 运行就用简洁界面 */
+  runStartAt = Date.now();
+  stopAlarm();
+  render();
+  tickLoop();
+  saveRun();
+}
+
+function resume() {
+  if (remain <= 0) { start(); return; }
+  endAt = Date.now() + remain;
+  mode = "run";
+  view = "mini";
+  runStartAt = Date.now();
+  render();
+  tickLoop();
+  saveRun();
+}
+
+function pause() {
+  remain = Math.max(0, endAt - Date.now());
+  mode = "pause";
+  view = "mini";              /* 点停止 = 切到简洁界面看结果 */
+  if (raf) { cancelAnimationFrame(raf); raf = null; }
+  stopGuard();
+  render();
+  saveRun();
+}
+
+function tickLoop() {
+  if (raf) cancelAnimationFrame(raf);
+  const step = () => {
+    if (mode !== "run") return;
+    lastTickAt = Date.now();
+    remain = Math.max(0, endAt - Date.now());
+    if (remain <= 0) { finish(); return; }
+    render();
+    raf = requestAnimationFrame(step);
+  };
+  raf = requestAnimationFrame(step);
+  startGuard();
+}
+
+/* ================= 到点兜底（定时器） =================
+   ★ 截止判定原来**只**靠 requestAnimationFrame。rAF 依赖 vsync：
+     显示器休眠 / 锁屏 / 窗口被完全遮挡时它会停，于是到点不会触发 finish() ——
+     不响铃、不红闪、没有通知。powerMonitor 的 resume 只能补"系统睡眠→唤醒"，
+     补不了"显示器关掉"。这是倒计时应用最不该有的一类漏响。
+     这里再挂一条 setInterval（定时器不受 vsync 影响，窗口 backgroundThrottling 已关）：
+       · 每秒查一次截止时间，命中就 finish；
+       · 顺手看 rAF 是不是停了（>800ms 没心跳），停了就自己把数字刷新上。 */
+let guardTimer = 0, lastTickAt = 0;
+function stopGuard() {
+  if (guardTimer) { clearInterval(guardTimer); guardTimer = 0; }
+}
+function startGuard() {
+  stopGuard();
+  guardTimer = setInterval(() => {
+    if (mode !== "run") { stopGuard(); return; }
+    const left = endAt - Date.now();
+    if (left <= 0) { remain = 0; stopGuard(); finish(-left); return; }
+    if (Date.now() - lastTickAt > 800) { remain = left; render(); }
+  }, 500);
+}
+
+/* ================= 到点 ================= */
+/* 到点之后每隔一秒刷一次"已过多久"，点掉就停 */
+let sinceTimer = 0, alarmAt = 0;
+function stopSince() {
+  clearInterval(sinceTimer);
+  sinceTimer = 0;
+  $("since").textContent = "";
+}
+function startSince(fromMs) {
+  stopSince();
+  alarmAt = Date.now() - Math.max(0, fromMs || 0);
+  const tick = () => {
+    const sec = Math.max(0, Math.floor((Date.now() - alarmAt) / 1000));
+    $("since").textContent = sec < 60
+      ? "已过 " + sec + " 秒"
+      : "已过 " + Math.floor(sec / 60) + " 分";
+  };
+  tick();
+  sinceTimer = setInterval(tick, 1000);
+}
+
+/* 番茄钟：阶段结束 → 提示 → 自动进入下一阶段 */
+let autoNextTimer = 0;
+
+function finish(overdueMs) {
+  mode = "idle";
+  remain = 0;
+  stopGuard();
+  alarmOn = true;
+  cardEl.classList.add("alarm");
+  /* 时间到 = 液位排空 */
+  $("rulerFill").style.height = "0px";
+  $("n0").textContent = "00:00";
+  $("icoPlay").classList.add("on");
+  $("icoPause").classList.remove("on");
+  playAlarm();          /* 先出声（本地文件，最快） */
+  /* 主进程：弹系统通知（专注结束→休息，休息结束→继续专注） */
+  const isPomo = pomoMode === "pomodoro";
+  try {
+    window.wgt.done({
+      phase: isPomo ? phase : "plain",
+      minutes: Math.round(isPomo ? phaseMinutes() : minutes),
+      overdueMin: Math.max(0, Math.round((overdueMs || 0) / 60000)),
+    });
+  } catch (e) {}
+  /* 只有番茄钟模式 + 自动循环 才自动切下一阶段；普通倒计时停在 00:00 */
+  clearTimeout(autoNextTimer);
+  if (isPomo && pomo.autoCycle) {
+    autoNextTimer = setTimeout(() => { if (alarmOn) nextPhase(true); }, 1600);
+  }
+  saveRun();
+}
+
+/* 切到下一阶段：专注→休息/长休息，休息→专注 */
+function nextPhase(auto) {
+  clearTimeout(autoNextTimer);
+  autoNextTimer = 0;
+  if (alarmOn) stopAlarm();
+  if (phase === "work") {
+    doneCount++;
+    round = doneCount + 1;
+    phase = (pomo.longEvery > 0 && doneCount % pomo.longEvery === 0) ? "longBreak" : "break";
+  } else {
+    phase = "work";
+  }
+  if (raf) { cancelAnimationFrame(raf); raf = null; }
+  stopGuard();
+  mode = "idle";
+  view = "set";
+  minutes = phaseMinutes();
+  remain = minutes * 60000;
+  totalMs = remain;
+  endAt = 0;
+  render();
+  saveRun();
+  if (auto) start();
+}
+
+/* 跳过当前阶段：在跑就跳到下一阶段继续跑，停着就只切阶段 */
+function skipPhase() {
+  if (pomoMode !== "pomodoro") return;   /* 普通倒计时没有"下一阶段" */
+  const wasRunning = mode === "run";
+  if (raf) { cancelAnimationFrame(raf); raf = null; }
+  stopGuard();
+  nextPhase(wasRunning);
+}
+
+/* ================= 到点提示音 =================
+   用 <audio> 放 assets/ 里的 WAV（file:// 页面里 fetch 会被拦，媒体元素不会）。
+   循环 / 只响一次由设置决定；"系统提示音"那条交给主进程 beep。 */
+let SOUND = { mute: false, loop: true, name: "a-dingdong" };
+let alarmAudio = null;
+let alarmStopTimer = 0;
+/* 响满 2 分钟就收声：人不在的话一直响很烦；红闪不停，回来还看得见 */
+const ALARM_MAX_MS = 120000;
+
+function alarmSrc(name) {
+  return "assets/alarm-" + name + ".wav";
+}
+
+function playAlarm() {
+  if (SOUND.mute) return;
+  if (SOUND.name === "system") return;   /* 系统音由主进程 beep */
+  try {
+    if (!alarmAudio) {
+      alarmAudio = new Audio();
+      alarmAudio.preload = "auto";
+    }
+    alarmAudio.src = alarmSrc(SOUND.name);
+    alarmAudio.loop = SOUND.loop !== false;
+    alarmAudio.volume = 1;
+    alarmAudio.currentTime = 0;
+    const p = alarmAudio.play();
+    if (p && p.catch) p.catch(() => {});
+    clearTimeout(alarmStopTimer);
+    alarmStopTimer = setTimeout(stopAlarmAudio, ALARM_MAX_MS);
+  } catch (e) { /* 没声卡就静音降级，通知还在 */ }
+}
+
+function stopAlarmAudio() {
+  clearTimeout(alarmStopTimer);
+  alarmStopTimer = 0;
+  if (!alarmAudio) return;
+  try { alarmAudio.pause(); alarmAudio.currentTime = 0; } catch (e) {}
+}
+
+/* 试听：不循环、放一次 */
+function previewSound(name) {
+  if (!name || name === "system") return;
+  try {
+    const a = new Audio(alarmSrc(name));
+    a.volume = 1;
+    const p = a.play();
+    if (p && p.catch) p.catch(() => {});
+  } catch (e) {}
+}
+
+/* ================= 提示音面板 =================
+   原生右键菜单没有 hover 事件，做不了"移上去就响"。
+   所以提示音做成卡片内面板：鼠标划过哪一行就试听哪一行，点一下选中。 */
+const SND_LIST = [
+  ["a-dingdong", "叮咚 · 清亮"],
+  ["b-soft", "柔和三连"],
+  ["c-beep", "电子表 · 三短声"],
+  ["d-bell", "低钟 · 沉稳"],
+  ["e-wood", "木质叩击"],
+  ["system", "系统提示音"],
+];
+
+function renderSndList() {
+  const box = $("sndList");
+  if (!box) return;
+  box.innerHTML = SND_LIST.map(([id, label]) =>
+    '<div class="sndrow' + (SOUND.name === id ? " on" : "") + '" data-id="' + id + '">' +
+      '<i class="dotm"></i><span>' + label + '</span></div>').join("");
+}
+
+let hoverT = 0;
+$("sndList").addEventListener("mouseover", (e) => {
+  const row = e.target.closest(".sndrow");
+  if (!row) return;
+  if (row.dataset.id === "system") return;      /* 系统音没法预览 */
+  clearTimeout(hoverT);
+  /* 稍微延后一点：鼠标扫过一串时不会一串声音连着炸 */
+  hoverT = setTimeout(() => previewSound(row.dataset.id), 120);
+});
+$("sndList").addEventListener("mouseleave", () => clearTimeout(hoverT));
+$("sndList").addEventListener("click", (e) => {
+  const row = e.target.closest(".sndrow");
+  if (!row) return;
+  SOUND.name = row.dataset.id;
+  renderSndList();
+  if (window.wgt.setSound) window.wgt.setSound(SOUND.name);
+  if (SOUND.name !== "system") previewSound(SOUND.name);
+});
+$("sndClose").addEventListener("click", () => $("sndPanel").classList.remove("on"));
+
+function showSndPanel() {
+  /* 注意：这里原来还有一句关掉"外观面板"的代码，
+     但外观面板已经搬到卡片外的独立小窗了，元素不存在 —— 留着会抛错，
+     整个函数直接中断，提示音面板就打不开了（用户报的"提醒音又没了"）。 */
+  renderSndList();
+  $("sndPanel").classList.add("on");
+  /* 打开时把音频解锁一下：有些环境要一次用户手势才允许播放 */
+  try { if (AC && AC.state === "suspended") AC.resume(); } catch (e) {}
+}
+if (window.wgt.onShowSound) window.wgt.onShowSound(showSndPanel);
+
+if (window.wgt.getSound) {
+  window.wgt.getSound().then((v) => { if (v) SOUND = v; }).catch(() => {});
+}
+if (window.wgt.onSound) window.wgt.onSound((v) => { if (v) SOUND = v; });
+if (window.wgt.onPreview) window.wgt.onPreview(previewSound);
+
+function stopAlarm() {
+  if (!alarmOn) return;
+  alarmOn = false;
+  cardEl.classList.remove("alarm", "over");
+  stopAlarmAudio();                            /* 本地音频停掉 */
+  stopSince();                                 /* "已过 X"也收掉 */
+  try { window.wgt.dismiss(); } catch (e) {}   /* 让主进程也停（系统音） */
+}
+
+/* 把用户打的字变成时间。
+   支持：90（按当前单位） / 3:30（分:秒） / 45s / 45秒 / 2m / 2分 / 1m30s
+   超出范围就提示一句并保持原值，不崩。 */
+function parseTyped(raw) {
+  const t = String(raw == null ? "" : raw).trim().toLowerCase();
+  if (!t) return null;
+
+  const mmss = t.match(/^(\d{1,3})\s*[:：]\s*(\d{1,2})$/);
+  if (mmss) {
+    const m = Number(mmss[1]), sec = Number(mmss[2]);
+    if (sec > 59) return { bad: "秒数不能超过 59" };
+    return { sec: m * 60 + sec, unit: "min" };
+  }
+  const withU = t.match(/^(\d{1,3})\s*(s|秒|m|分|分钟)$/);
+  if (withU) {
+    const n = Number(withU[1]);
+    return /s|秒/.test(withU[2]) ? { sec: n, unit: "sec" } : { sec: n * 60, unit: "min" };
+  }
+  const plain = t.match(/^(\d{1,3})$/);
+  if (plain) {
+    const n = Number(plain[1]);
+    return unit === "sec" ? { sec: n, unit: "sec" } : { sec: n * 60, unit: "min" };
+  }
+  return { bad: "看不懂，试试 25 / 3:30 / 45s" };
+}
+
+function applyTyped(raw) {
+  const r = parseTyped(raw);
+  if (!r) return;
+  if (r.bad) { flashTip(r.bad); return; }
+  if (r.unit === "sec" && r.sec > MIN_MAX) { flashTip("秒数最多 " + MIN_MAX); return; }
+  if (r.unit === "min" && r.sec > MIN_MAX * 60) { flashTip("分钟最多 " + MIN_MAX); return; }
+  if (r.sec <= 0) { flashTip("要大于 0"); return; }
+
+  if (r.unit === "sec" && r.sec < 60) {
+    unit = "sec";
+    setMinutes(r.sec);
+  } else {
+    unit = "min";
+    setMinutes(Math.round(r.sec / 60 * 10) / 10);   /* 3:30 → 3.5 分钟 */
+  }
+  saveUnit();
+  render();
+}
+
+/* 一句小提示（超范围/看不懂），2 秒后自己消失 */
+let tipTimer = 0;
+function flashTip(msg) {
+  let el = $("tip");
+  if (!el) return;
+  el.textContent = msg;
+  el.classList.add("on");
+  clearTimeout(tipTimer);
+  tipTimer = setTimeout(() => el.classList.remove("on"), 2000);
+}
+
+/* ================= 交互：滚轮 / 触控板双指 =================
+   鼠标滚轮一格大约 deltaY = ±100；触控板双指是一帧几个像素、连续几十个事件。
+   所以不能"收到 deltaY 就滚一格"——那样双指一划会瞬间冲过几十格。
+   改成累加：攒够 WHEEL_STEP 才落一格，停下 220ms 就把余量清零。 */
+const WHEEL_STEP = 46;          /* 攒够这么多像素 = 一格（鼠标一格约 100，够灵敏） */
+let wheelAcc = 0, wheelTimer = 0;
+
+function wheelUnit(e) {
+  /* deltaMode: 0=像素 1=行 2=页，统一换算成像素 */
+  if (e.deltaMode === 1) return e.deltaY * 16;
+  if (e.deltaMode === 2) return e.deltaY * 400;
+  return e.deltaY;
+}
+
+cardEl.addEventListener("wheel", (e) => {
+  e.preventDefault();
+  if (mode === "run") return;                 /* 跑着的时候不调，先暂停 */
+  if (alarmOn) { stopAlarm(); setMinutes(minutes); return; }
+
+  const d = wheelUnit(e);
+  /* 反向就先清掉余量，别让"先往上一点再往下"抵账 */
+  if ((wheelAcc > 0 && d < 0) || (wheelAcc < 0 && d > 0)) wheelAcc = 0;
+  wheelAcc += d;
+
+  clearTimeout(wheelTimer);
+  wheelTimer = setTimeout(() => { wheelAcc = 0; }, 220);
+
+  while (Math.abs(wheelAcc) >= WHEEL_STEP) {
+    /* 方向：往下滚（deltaY > 0）是 0→1→2… 递增（用户要求，和常见滚轮相反） */
+    const dir = wheelAcc > 0 ? 1 : -1;
+    wheelAcc = 0;             /* 落一格就清零，避免余量越攒越多、越滚越快 */
+    rollTo(dir, wrapMin(curValue() + dir), false);
+    break;                    /* 一个事件最多落一格，连续事件下一帧继续 */
+  }
+}, { passive: false });
+
+/* ================= 单位切换（走右键菜单） =================
+   卡片上不再放徽标：顶部那排东西太挤，用户要求清掉。 */
+if (window.wgt.onUnit) {
+  window.wgt.onUnit((u) => {
+    if (u !== "min" && u !== "sec") return;
+    unit = u;
+    saveUnit();
+    render();
+  });
+}
+
+/* 首用引导：只在第一次出现，操作一次或 10 秒后消失 */
+const HINT_KEY = "timer_hint_v1";
+let hintTimer = 0;
+function showHint(force) {
+  let seen = false;
+  try { seen = localStorage.getItem(HINT_KEY) === "1"; } catch (e) {}
+  if (seen && !force) return;
+  $("hint").classList.add("on");
+  clearTimeout(hintTimer);
+  hintTimer = setTimeout(markHint, 10000);
+}
+function markHint() {
+  clearTimeout(hintTimer);
+  $("hint").classList.remove("on");
+  try { localStorage.setItem(HINT_KEY, "1"); } catch (e) {}
+}
+if (window.wgt.onHint) window.wgt.onHint(() => { try { localStorage.removeItem(HINT_KEY); } catch (e) {} showHint(true); });
+
+/* ================= 交互：重置 ================= */
+let runStartAt = 0;            /* 本轮开始跑的时刻，用来判断"已经跑了一会儿" */
+let resetArm = 0;              /* 重置的两段确认时间戳 */
+
+function doReset() {
+  /* 跑了一会儿再按重置 = 可能误触，先要求再点一次 */
+  const elapsed = runStartAt ? Date.now() - runStartAt : 0;
+  if (mode === "run" && elapsed > 10000 && Date.now() - resetArm > 3000) {
+    resetArm = Date.now();
+    $("reset").classList.add("arm");
+    flashTip("再点一次确认重来");
+    setTimeout(() => $("reset").classList.remove("arm"), 3000);
+    return;
+  }
+  resetArm = 0;
+  $("reset").classList.remove("arm");
+  const wasRunning = mode === "run";
+  if (autoNextTimer) { clearTimeout(autoNextTimer); autoNextTimer = 0; }
+  if (raf) { cancelAnimationFrame(raf); raf = null; }
+  stopGuard();
+  skipSquareGuard = true;
+  stopAlarm();
+  mode = "idle";
+  view = "set";
+  runStartAt = 0;
+  if (pomoMode === "pomodoro") {
+    /* 番茄钟：归零回第 1 轮专注 */
+    phase = "work";
+    round = 1;
+    doneCount = 0;
+    minutes = pomo.workMin;
+  }
+  /* 普通倒计时：保持当前设定分钟数，重来一遍 */
+  remain = minutes * 60000;
+  totalMs = remain;
+  endAt = 0;
+  render();
+  saveRun();
+  if (wasRunning) start();
+  skipSquareGuard = false;
+}
+$("reset").addEventListener("click", doReset);
+/* 右键菜单「重置计时」 */
+if (window.wgt && window.wgt.onReset) window.wgt.onReset(doReset);
+
+/* ================= 交互：播放 / 暂停 ================= */
+$("play").addEventListener("click", () => {
+  markHint();
+  $("sndPanel").classList.remove("on");
+  /* 到点后点播放：番茄钟进下一阶段，普通倒计时重来 */
+  if (alarmOn) {
+    stopAlarm();
+    if (pomoMode === "pomodoro") nextPhase(true);
+    else start();
+    return;
+  }
+  if (mode === "run") pause();
+  else if (mode === "pause") resume();
+  else start();
+});
+
+/* 到点后点卡片任意处也算"我知道了"：番茄钟进下一阶段，普通倒计时重来 */
+cardEl.addEventListener("mousedown", (e) => {
+  if (alarmOn && !e.target.closest("button, input, .panel")) {
+    stopAlarm();
+    if (pomoMode === "pomodoro") nextPhase(true);
+    else start();
+  }
+}, true);
+
+/* ================= 交互：双击改时间 =================
+   桌面层里卡片拿不到键盘焦点，所以和另两张卡一样走"幽灵输入窗"代收：
+   focusin 报矩形 → 主进程把隐形窗摆上去代打 → 文字实时镜像回来。 */
+const edit = $("edit");
+let editOn = false;
+
+function openEdit() {
+  if (mode === "run") return;
+  editOn = true;
+  edit.value = label(minutes);
+  edit.classList.add("on");
+  $("n0").style.visibility = "hidden";
+  edit.focus();
+  edit.select();
+  const r = edit.getBoundingClientRect();
+  try { window.wgt.imeBegin({ x: r.left, y: r.top, w: r.width, h: r.height, value: edit.value }); } catch (e) {}
+  /* 告诉主进程"正在改时间"：桌面层里点桌面不会让窗口失焦，
+     页面收不到那个点击，只能让主进程代听，然后回一条 commit-edit */
+  try { window.wgt.editing(true); } catch (e) {}
+}
+
+function closeEdit(commit) {
+  if (!editOn) return;
+  editOn = false;
+  edit.classList.remove("on");
+  $("n0").style.visibility = "";
+  try { window.wgt.imeEnd(); } catch (e) {}
+  try { window.wgt.editing(false); } catch (e) {}
+  if (commit) applyTyped(edit.value);
+  render();
+}
+
+$("n0").addEventListener("dblclick", openEdit);
+cardEl.addEventListener("dblclick", (e) => {
+  if (e.target.closest("button, input, .panel")) return;
+  if (!editOn) openEdit();
+});
+
+edit.addEventListener("keydown", (e) => {
+  if (e.key === "Enter") { e.preventDefault(); closeEdit(true); }
+  else if (e.key === "Escape") { e.preventDefault(); closeEdit(false); }
+});
+edit.addEventListener("blur", () => { if (editOn) closeEdit(true); });
+
+/* 输入桥回来的字 */
+if (window.wgt.onImeText) {
+  window.wgt.onImeText((v) => {
+    /* 放行冒号和时间单位，否则 3:30 / 45s 打不进去 */
+    edit.value = String(v == null ? "" : v).replace(/[^\d:：sSmM分秒]/g, "").slice(0, 8);
+  });
+  window.wgt.onImeCommit(() => closeEdit(true));
+  window.wgt.onImeCancel(() => { edit.value = ""; closeEdit(false); });
+  window.wgt.onImeBlur(() => { if (editOn) closeEdit(true); });
+}
+
+/* 简洁界面左上角的返回箭头 → 回到设定界面（计时仍停着，可以继续调时间） */
+$("back").addEventListener("click", () => {
+  /* 返回 = 放弃这次计时，直接回到默认设定 ——
+     不把"还剩多少"带回去（否则再点播放会从半截继续，容易误会）。
+     横版里返回要先切回方形：滚轮那套槽位是按 260x240 排的，横条装不下。 */
+  if (raf) { cancelAnimationFrame(raf); raf = null; }
+  mode = "idle";
+  view = "set";
+  runStartAt = 0;
+  stopAlarm();
+  remain = totalSeconds() * 1000;   /* 剩余量回到设定值 */
+  if (document.body.classList.contains("wide")) {
+    try { window.wgt.setLayout("full"); } catch (e) {}
+  }
+  render();
+  saveRun();
+});
+
+/* 点面板外的空白 = 收起（设置即时生效，收起就等于"确定"） */
+document.addEventListener("mousedown", (e) => {
+  if ($("sndPanel").classList.contains("on") && !e.target.closest("#sndPanel")) $("sndPanel").classList.remove("on");
+}, true);
+
+/* 「再来一次」内部会先回 idle 再 start，那一瞬不该被当成"空闲"切回方形 */
+let skipSquareGuard = false;
+
+/* 设置界面只保留方形：横版只用于"倒计时中"。
+   否则存档停在横版时重启，滚轮会被塞进 213x93 的横条里。 */
+function ensureSquareWhenIdle() {
+  if (skipSquareGuard) return;          /* 「再来一次」中间那一瞬不算空闲 */
+  if (!document.body.classList.contains("wide")) return;
+  const running = mode === "run" || mode === "pause" || cardEl.classList.contains("alarm");
+  if (!running) { try { window.wgt.setLayout("full"); } catch (e) {} }
+}
+
+/* 横竖切换：方形 ⇄ 横版 */
+$("rot").addEventListener("click", (e) => {
+  e.stopPropagation();
+  const wide = document.body.classList.contains("wide");
+  try { window.wgt.setLayout(wide ? "full" : "wide"); } catch (er) {}
+});
+
+/* 收到布局变更：换样式 + 重绘（横版里一律用简洁界面） */
+function applyLayoutClass(v) {
+  const wide = v === "wide";
+  document.body.classList.toggle("wide", wide);
+  render();
+}
+if (window.wgt.onLayout) window.wgt.onLayout(applyLayoutClass);
+if (window.wgt.getLayout) {
+  window.wgt.getLayout().then(applyLayoutClass).catch(() => {});
+}
+
+/* 小叉：退出（和右键菜单的"退出"同一条路） */
+$("xclose").addEventListener("click", () => {
+  try { window.wgt.close(); } catch (e) {}
+});
+
+/* ================= 交互：四角缩放 =================
+   只改窗口尺寸 + zoomFactor（等比），布局不用重算。 */
+document.querySelectorAll(".rz").forEach((el) => {
+  el.addEventListener("mousedown", (e) => {
+    if (e.button !== 0) return;
+    e.preventDefault();
+    e.stopPropagation();
+    try { window.wgt.resizeBegin(el.dataset.c); } catch (er) {}
+  });
+});
+const endResize = () => { try { window.wgt.resizeEnd(); } catch (e) {} };
+window.addEventListener("mouseup", endResize);
+window.addEventListener("blur", endResize);
+
+/* ================= 交互：拖动窗口 =================
+   按住卡片空白处拖（按钮/输入框/面板除外）。位移由主进程跟系统光标算，
+   页面只报"按下/松开"。 */
+const NO_DRAG = "button, input, .panel, .rz";
+/* 竖线（分界线）的 x：它左边是"数字那一列"，按住上下拖 = 拨轮调时间 */
+const RULER_X = 97;
+/* 顶部这一条横跨整卡，专门留给"拖窗口" ——
+   不然分界线左边全是调时间区，卡片就没地方抓了。
+   32px 的依据：再窄容易按偏、变成调时间；再宽就开始吃掉最上面那档数字的可调范围。 */
+const DRAG_TOP_BAND = 32;
+let pressing = false;
+let scrub = null;          /* { y } 按住左半边拖动时用 */
+
+window.addEventListener("mousedown", (e) => {
+  if (e.button !== 0) return;
+  if (e.target.closest(NO_DRAG)) return;
+  /* 顶部那一条：始终用来拖窗口（不受分界线限制） */
+  const cardRect = cardEl.getBoundingClientRect();
+  const inTopBand = (e.clientY - cardRect.top) <= DRAG_TOP_BAND;
+  /* 分界线左边（且不在顶部那条）：不搬窗口，改成拨轮 */
+  if (!inTopBand && e.clientX <= RULER_X && mode !== "run") {
+    scrub = { base: e.clientY };
+    document.body.classList.add("scrubbing");
+    cardEl.classList.add("rolling");          /* 外围格淡出，位移时不露错位 */
+    $("numBand").style.transition = "none";   /* 拖动期间要 1:1 跟手 */
+    $("tickBand").style.transition = "none";
+    return;
+  }
+  pressing = true;
+  document.body.classList.add("press-lock");
+  try { window.wgt.dragBegin(); } catch (er) {}
+}, true);
+
+/* 拨轮：数字带直接跟着鼠标走（不是一格一格跳），跨过一格才落定一个值。
+   之前只做"跨一格才动一次"，中间那段完全不动，手感是"不跟手"。 */
+function scrubCommit(dir) {
+  setMinutes(wrapMin(minutes + dir));
+  const band = $("numBand"), tick = $("tickBand");
+  band.style.transform = "";        /* 文字已经换了一批，带子回到原位 */
+  tick.style.transform = "";
+}
+
+window.addEventListener("mousemove", (e) => {
+  if (!scrub) return;
+  let dy = e.clientY - scrub.base;
+  while (dy <= -SLOT_PX) { scrub.base -= SLOT_PX; scrubCommit(1); dy = e.clientY - scrub.base; }
+  while (dy >= SLOT_PX) { scrub.base += SLOT_PX; scrubCommit(-1); dy = e.clientY - scrub.base; }
+  const band = $("numBand"), tick = $("tickBand");
+  band.style.transform = "translateY(" + dy + "px)";
+  tick.style.transform = "translateY(" + dy + "px)";
+});
+
+const endScrub = () => {
+  if (!scrub) return;
+  scrub = null;
+  document.body.classList.remove("scrubbing");
+  const band = $("numBand"), tick = $("tickBand");
+  band.style.transition = "";       /* 恢复过渡，让带子自己滑回 0 */
+  tick.style.transition = "";
+  band.style.transform = "";
+  tick.style.transform = "";
+  cardEl.classList.remove("rolling");
+};
+window.addEventListener("mouseup", endScrub);
+window.addEventListener("blur", endScrub);
+const endPress = () => {
+  if (!pressing) return;
+  pressing = false;
+  document.body.classList.remove("press-lock");
+  try { window.wgt.dragEnd(); } catch (er) {}
+};
+window.addEventListener("mouseup", endPress);
+window.addEventListener("blur", endPress);
+
+/* ================= 右键菜单 ================= */
+cardEl.addEventListener("contextmenu", (e) => {
+  e.preventDefault();
+  try { window.wgt.menu(); } catch (er) {}
+});
+
+/* ================= 桌面快照背景 ================= */
+function setBackdrop(p) {
+  const bd = $("bd");
+  if (!p || !p.url) { document.body.classList.remove("has-bd"); return; }
+  bd.style.backgroundImage = "url(" + p.url + ")";
+  bd.style.backgroundSize = "100% 100%";
+  bd.style.left = p.left + "px";
+  bd.style.top = p.top + "px";
+  bd.style.width = p.w + "px";
+  bd.style.height = p.h + "px";
+  bd.style.position = "absolute";
+  document.body.classList.add("has-bd");
+}
+if (window.wgt.onBackdrop) window.wgt.onBackdrop(setBackdrop);
+if (window.wgt.backdropNow) window.wgt.backdropNow().then(setBackdrop).catch(() => {});
+
+/* ================= 外观（透明度 / 磨砂） =================
+   设置面板已经挪到卡片外面的独立小窗（look.html），
+   卡片这边只负责"收到值就应用"，不再自带滑杆。 */
+const LOOK = { alpha: 1, frost: 0 };
+function applyLook() {
+  const r = document.documentElement.style;
+  r.setProperty("--a", String(LOOK.alpha));
+  /* ★ 磨砂已按用户要求彻底关掉：快照永远不模糊（-frost 强制 0）。
+     原来这里读 LOOK.frost，用户把滑杆拉到 16px 后整张卡就是一片糊 ——
+     桌面挂件要的是"看清桌面"，不是"隔着毛玻璃看"。 */
+  r.setProperty("--frost", "0px");
+  /* 不透明（alpha≈1）时把桌面快照整层关掉，避免圆角外那圈模糊光晕 */
+  document.body.classList.toggle("opaque", LOOK.alpha >= 0.995);
+}
+function setLook(v) {
+  if (!v) return;
+  if (Number.isFinite(v.alpha)) LOOK.alpha = Math.min(1, Math.max(0.08, v.alpha));
+  if (Number.isFinite(v.frost)) LOOK.frost = Math.min(20, Math.max(0, v.frost));
+  applyLook();
+}
+if (window.wgt.onNoReg) {
+  window.wgt.onNoReg((v) => document.body.classList.toggle("noreg", v));
+}
+if (window.wgt.onLook) window.wgt.onLook(setLook);
+if (window.wgt.getLook) {
+  window.wgt.getLook().then(setLook).catch(() => {});
+}
+applyLook();
+
+/* ================= 右键菜单的「专注 N 分钟」= 进入番茄钟循环 ================= */
+if (window.wgt.onPreset) {
+  window.wgt.onPreset((m) => { if (m > 0) setPomodoro(m); });
+}
+/* 右键菜单「跳过当前阶段」 */
+if (window.wgt.onSkip) window.wgt.onSkip(skipPhase);
+
+/* ================= 从存档恢复 =================
+   运行中：按结束时间戳重算剩余（睡多久都不漂）；
+   期间已经到点：立刻提醒，并标注超时了多久；
+   暂停中：原样恢复剩余毫秒。 */
+function restoreRun() {
+  let o = null;
+  try { o = JSON.parse(localStorage.getItem(RUN_KEY) || "null"); } catch (e) {}
+  if (!o || typeof o !== "object") return false;
+
+  if (o.pomoMode === "plain" || o.pomoMode === "pomodoro") pomoMode = o.pomoMode;
+  if (o.phase === "work" || o.phase === "break" || o.phase === "longBreak") phase = o.phase;
+  if (Number.isFinite(o.round)) round = Math.max(1, Math.round(o.round));
+  if (Number.isFinite(o.doneCount)) doneCount = Math.max(0, Math.round(o.doneCount));
+  if (Number.isFinite(o.minutes)) minutes = clampMin(o.minutes);
+  totalMs = Number(o.totalMs) > 0 ? Number(o.totalMs) : minutes * 60000;
+
+  if (o.mode === "run" && Number.isFinite(o.endAt)) {
+    const left = o.endAt - Date.now();
+    if (left <= 0) {                 /* 关机/睡眠期间就到点了 */
+      mode = "run";
+      remain = 0;
+      finish(-left);
+      return true;
+    }
+    mode = "run";
+    remain = left;
+    endAt = o.endAt;
+    render();
+    tickLoop();
+    return true;
+  }
+
+  if (o.mode === "pause" && Number.isFinite(o.remain)) {
+    mode = "pause";
+    remain = Math.max(0, o.remain);
+    endAt = Date.now() + remain;
+    render();
+    return true;
+  }
+  return false;
+}
+
+/* ================= 启动 ================= */
+loadUnit();
+document.body.classList.add(window.wgt && window.wgt.acrylic ? "acrylic" : "solid");
+if (!restoreRun()) {
+  pomoMode = "plain";
+  remain = minutes * 60000;
+  totalMs = remain;
+  render();
+}
+showHint();
+
+/* 番茄钟配置：启动从主进程拉一次，之后主进程/设置浮窗改了实时同步 */
+if (window.wgt.getPomo) window.wgt.getPomo().then(applyPomo).catch(() => {});
+if (window.wgt.onPomo) window.wgt.onPomo(applyPomo);
+
+/* 睡眠/休眠回来：按结束时间戳重算，别让数字停在睡前那一刻 */
+if (window.wgt.onResume) {
+  window.wgt.onResume(() => {
+    if (mode !== "run") return;
+    const left = endAt - Date.now();
+    if (left <= 0) { remain = 0; finish(-left); }
+    else { remain = left; render(); tickLoop(); }
+  });
+}
+
+/* 用户点了系统通知：收掉红闪和声音 */
+/* 点桌面空白 = 确定（不用按回车） */
+if (window.wgt.onCommitEdit) window.wgt.onCommitEdit(() => { if (editOn) closeEdit(true); });
+
+if (window.wgt.onDismiss) {
+  window.wgt.onDismiss(() => {
+    stopAlarm();
+    if (pomoMode === "pomodoro") nextPhase(true);
+    else start();
+  });
+}
+</script>
+</body>
+</html>

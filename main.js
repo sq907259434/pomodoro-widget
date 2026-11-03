@@ -1,0 +1,1696 @@
+/* 倒计时卡片（独立版）—— Electron 主进程
+   和「待办清单」「天气卡片」同一套骨架（视觉与交互独立，代码不共用）：贴进桌面层、桌面快照做背景、
+   主进程跟光标拖动、幽灵输入窗代收键盘。本卡只做一件事：倒计时。 */
+
+const { app, BrowserWindow, ipcMain, Menu, screen, shell, nativeTheme, Notification, powerMonitor } = require("electron");
+
+/* Windows 上不设 AppUserModelId，toast 通知根本不弹（静默失败）。 */
+try { app.setAppUserModelId("com.pomodoro.desktop"); } catch (e) {}
+const path = require("path");
+const fs = require("fs");
+const { execFile } = require("child_process");
+const createDesktopLayer = require("./desktop-layer");
+const createBackdrop = require("./backdrop");
+
+/* 卡片尺寸 + 四周留给投影的透明边距。
+   CARD_H 从 392 收到 330（v1.0.13，用户挑的 C 档）：主区 .main 是 flex:1 + 内容垂直
+   居中，卡片多高，顶部"昆明 → 22°"那段空白就一半归它 —— 只调内边距没用，内容会重新
+   居中。矮 62 之后这段净间距从 57px 收到 26px，上下多余留白一起消掉。
+   主区在 374 的窗口里仍有 117px，内容（大温度+描述+范围）约 101px，不挤。 */
+const CARD_W = 260;
+const CARD_H = 240;
+/* 横版：顶部一排 ← / 切换 / ×，下面一行 重置 · 数字 · 播放 */
+const WIDE_W = 213, WIDE_H = 93, WIDE_RAD = 18;
+function layoutIsWide() { return readState().layout === "wide"; }
+function cardSize() { return layoutIsWide() ? { w: WIDE_W, h: WIDE_H } : { w: CARD_W, h: CARD_H }; }
+/* 横条（mini 布局）已按用户要求移除，只保留方形卡片。 */
+/* 四角拖拽缩放：只做等比，页面用 zoomFactor 整体放大，布局不用重算 */
+const SCALE_MIN = 0.7, SCALE_MAX = 2.2;
+
+function readScale() {
+  const v = Number(readState().scale);
+  if (!Number.isFinite(v)) return 1;
+  return Math.min(SCALE_MAX, Math.max(SCALE_MIN, v));
+}
+
+/* Windows 11 22H2+ 才有原生 acrylic。有就用系统磨砂（实时、真实模糊窗口背后的桌面）；
+   没有就退回半透明渐变。
+
+   ★ 24H2（build 26100）起 DWMSBT_TRANSIENTWINDOW 已经废了 —— 实测 build 26200：
+     无论窗口背后是壁纸还是纯白网页，backgroundMaterial:"acrylic" 的窗口内部取像素
+     永远是 #d3d3d3（固定兜底色、不是采样；同一次测试里 mica/tabbed 还能跟随背景）。
+     而且这层材质由 DWM 画在**整个窗口矩形**上，SetWindowRgn 裁不掉它 ——
+     卡片圆角外侧就露出 4 个方块。所以 24H2 起直接走透明自绘。 */
+function acrylicSupported() {
+  try {
+    const parts = String(require("os").release()).split(".");
+    const build = parseInt(parts[2], 10);
+    if (!Number.isFinite(build)) return false;
+    return build >= 22621 && build < 26100;
+  } catch (e) {
+    return false;
+  }
+}
+/* 磨砂材质是"系统给顶层窗口画的底"，贴进桌面层就没了 —— 所以两种模式互斥：
+   开了「贴进桌面」就强制走透明自绘（多 22px 投影边距），否则会出现一块灰底。
+   ⚠ 这两个值必须等 app ready 之后再定：模块加载时读 state 拿不到正确的 userData 路径
+   （实测会读成空 → 磨砂照开 → 桌面层模式下变成一块灰底），所以在 whenReady 里赋值。 */
+let USE_ACRYLIC = acrylicSupported();
+let PAD = 0;   /* 本卡没有自绘投影：窗口 == 卡片，尺寸就是设计尺寸（另两张留了 22px 投影边距，卡片实际被撑大 44px） */
+/* 磨砂模式窗口就是卡片大小（页面全透明，投影也画不出来）；
+   透明窗口那边由页面自绘投影，四周留 22px 透明边距。 */
+
+let cardWin = null;
+
+/* ---------- 把窗口沉到最底（HWND_BOTTOM） ----------
+   用于所有"撤销置顶"的地方：Windows 把窗口从置顶组挪回普通组时，是插到普通组
+   **最上面**，于是卡片会一直挡在别人前面，直到用户点一下那个窗口才被压回去
+   （用户实测反馈：Win+D 退出「显示桌面」后卡片浮在刚恢复的窗口前面）。
+   实测 Progman（桌面）永远被系统压在 Z 序最底，所以沉底后卡片依然可见：
+   PowerShell 实测 卡片@41 / Progman@42 —— 桌面之上、其它应用之下，正是桌面卡片该待的位置。 */
+const SWP_SINK = 0x0001 | 0x0002 | 0x0010 | 0x0200;   /* NOSIZE|NOMOVE|NOACTIVATE|NOOWNERZORDER */
+let _SetWindowPos = null;
+try {
+  _SetWindowPos = require("koffi").load("user32.dll")
+    .func("SetWindowPos", "bool", ["void *", "void *", "int", "int", "int", "int", "uint32"]);
+} catch (e) { _SetWindowPos = null; }   /* 加载失败就只影响"沉底"，不影响其它功能 */
+
+/* 桌面层句柄（createWindow 里赋值）。沉底这类"z 序操作"必须先问它一句：
+   卡片一旦挂进 Progman，HWND_BOTTOM 会把它塞到 SHELLDLL_DefView（铺满全屏的图标层）
+   下面 —— 表现就是「卡片自己消失了」，而 IsWindowVisible 还是 true、没有任何事件。
+   实测证据见 desktop-layer.js 文件头坑 4。 */
+let DL = null;
+
+function sinkWin(win) {
+  if (DL && DL.isOn()) return;     /* 桌面层模式下永远不沉底 */
+  if (!_SetWindowPos || !win || win.isDestroyed()) return;
+  try {
+    const buf = win.getNativeWindowHandle();
+    const hwnd = buf.length >= 8 ? Number(buf.readBigUInt64LE(0)) : buf.readUInt32LE(0);
+    _SetWindowPos(hwnd, 1, 0, 0, 0, 0, SWP_SINK);   /* 1 = HWND_BOTTOM */
+  } catch (e) { /* 失败就保持现状：卡片在最前，点一下别的窗口就退回去，不致命 */ }
+}
+
+/* 恢复"用户设置的置顶状态"，并保证非置顶时真正沉底（而不是卡在最前） */
+function restoreTop(win) {
+  if (!win || win.isDestroyed()) return;
+  if (DL && DL.isOn()) return;   /* 桌面层里没有"置顶/沉底"这回事，一沉就掉进图标层后面 */
+  let want = false;
+  try { want = readState().top === true; } catch (e) { want = false; }
+  win.setAlwaysOnTop(want, "floating");
+  if (!want) setTimeout(() => sinkWin(win), 60);   /* 等 DWM 处理完"取消置顶"，再沉底 */
+}
+
+const stateFile = () => path.join(app.getPath("userData"), "widget-state.json");
+
+/* ---------- 统一日志（带体积上限） ----------
+   每 5 秒一条心跳那条原来没有任何上限：约 1.5MB/天、500MB/年，日志迟早把盘吃满。
+   现在所有落盘都走 appendLog，超过 512KB 就整体清空重来（只留最近一段，够定位问题）。 */
+const LOG_MAX = 512 * 1024;
+const logFile = () => path.join(app.getPath("userData"), "win-events.log");
+function appendLog(line) {
+  try {
+    const f = logFile();
+    try { if (fs.statSync(f).size > LOG_MAX) fs.writeFileSync(f, ""); } catch (e) {}
+    fs.appendFileSync(f, line);
+  } catch (e) { /* 日志失败不影响功能 */ }
+}
+
+
+/* 启动期的异常必须落盘：createWindow 在 app.whenReady().then() 里跑，
+   里面抛错只会变成一个静默的 unhandledRejection —— 进程活着、窗口不出现、
+   日志一个字都没有，排查时完全看不出哪坏了（打包版踩过这个坑）。 */
+function logBootErr(kind, e) {
+  try {
+    appendLog(
+      new Date().toISOString() + " " + kind + " " + ((e && e.stack) || String(e)) + "\n");
+  } catch (x) {}
+}
+process.on("uncaughtException", (e) => logBootErr("UNCAUGHT", e));
+process.on("unhandledRejection", (e) => logBootErr("UNHANDLED", e));
+
+function readState() {
+  try {
+    return JSON.parse(fs.readFileSync(stateFile(), "utf8")) || {};
+  } catch (e) {
+    return {};
+  }
+}
+
+/* ================= 番茄钟配置 =================
+   主进程是权威：卡片和设置浮窗都通过 IPC 读写，避免两处存档打架。 */
+const POMO_DEFAULT = { workMin: 25, breakMin: 5, longBreakMin: 15, longEvery: 0, autoCycle: true };
+function clampInt(v, lo, hi, dflt) {
+  const n = Number(v);
+  if (!Number.isFinite(n)) return dflt;
+  return Math.max(lo, Math.min(hi, Math.round(n)));
+}
+function readPomo() {
+  const p = readState().pomo || {};
+  return {
+    workMin: clampInt(p.workMin, 1, 60, POMO_DEFAULT.workMin),
+    breakMin: clampInt(p.breakMin, 1, 60, POMO_DEFAULT.breakMin),
+    longBreakMin: clampInt(p.longBreakMin, 1, 60, POMO_DEFAULT.longBreakMin),
+    longEvery: clampInt(p.longEvery, 0, 12, POMO_DEFAULT.longEvery),
+    autoCycle: p.autoCycle !== false,
+  };
+}
+
+function patchState(patch) {
+  const s = readState();
+  Object.assign(s, patch);
+  writeState(s);
+}
+
+/* 贴进桌面层（state.desktopLayer）：窗口层级放在启动时做，切换就重启自己。
+   万一贴进去看不见，按 Ctrl+Alt+2 = 把状态改回 false 再重启，窗口一定回来。 */
+/* ================= 日间 / 夜间 =================
+   存档里存 theme：auto（默认，跟系统）/ light / dark。
+   页面只认最终结果（body.light 或不加），切换逻辑全在主进程，
+   这样系统主题变了、用户点菜单，都走同一条路。 */
+function themeSetting() {
+  const t = readState().theme;
+  return t === "light" || t === "dark" ? t : "auto";
+}
+function resolvedTheme() {
+  const t = themeSetting();
+  if (t !== "auto") return t;
+  try { return nativeTheme.shouldUseDarkColors ? "dark" : "light"; } catch (e) { return "dark"; }
+}
+function pushTheme() {
+  if (cardWin && !cardWin.isDestroyed()) {
+    try { cardWin.webContents.send("wgt:theme", resolvedTheme()); } catch (e) {}
+  }
+}
+
+/* 常驻桌面（不再是个选项）：和天气卡一致，卡片默认就贴在桌面层，
+   Win+D 不会把它收走，有窗口盖住时自然被盖住。
+   唯一的开关是「所有窗口置顶」：置顶 = 脱离桌面层浮到最前。
+   两者天然互斥（子窗口不能置顶），所以桌面层直接由 top 推导，不单独存。 */
+function desktopLayerOn() {
+  try { return readState().top !== true; } catch (e) { return true; }
+}
+
+
+function writeState(s) {
+  try {
+    fs.mkdirSync(path.dirname(stateFile()), { recursive: true });
+    /* 原子写：先写临时文件，再用 rename 一瞬间替换正主。
+       直接改写原文件时，写一半断电/崩溃会留下半截 JSON，下次启动
+       readState 解析失败，位置和置顶就全丢了。rename 在同一块盘上是
+       原子操作——任何时刻文件要么是旧的、要么是完整的新的，没有中间态。 */
+    const tmp = stateFile() + ".tmp";
+    fs.writeFileSync(tmp, JSON.stringify(s, null, 2));
+    fs.renameSync(tmp, stateFile());
+  } catch (e) { /* 写不进去也不影响使用，只是记不住位置 */ }
+}
+
+/* ================= 拖动窗口：主进程直接跟着系统光标走 =================
+   为什么把系统拖动（-webkit-app-region: drag）换掉：
+     卡片贴进桌面层后是 Progman 的子窗口（WS_CHILD）。系统那套"非客户区拖动"
+     在子窗口上要么根本不进移动循环（按住拖，窗口一动不动），要么进得很勉强
+     —— 用户实测就是"跟着跑但慢半拍、还一闪一闪"。
+     子窗口本身完全能移动（原生 SetWindowPos 实测 6/6 帧跟手），所以自己搬。
+
+   为什么不让页面算位移再逐帧 IPC：窗口一动，渲染进程的 mousemove 就被节流，
+   事件挤成一团；再叠一次进程往返，手感必然慢。这里主进程每 8ms 读一次系统光标，
+   直接 SetWindowPos —— 延迟只剩一个定时器周期。
+
+   全程物理像素：GetCursorPos / GetWindowRect / SetWindowPos 同一套坐标系，
+   不做 DIP 换算（200% 缩放下算错就是走一半）。
+   位置用"原点 + 光标总位移"，不逐帧累加，避免取整误差越攒越偏。 */
+const _drg = (() => {
+  try {
+    const u = require("koffi").load("user32.dll");
+    return {
+      GetCursorPos: u.func("GetCursorPos", "bool", ["void *"]),
+      GetWindowRect: u.func("GetWindowRect", "bool", ["void *", "void *"]),
+      SetWindowPos: u.func("SetWindowPos", "bool", ["void *", "void *", "int", "int", "int", "int", "uint32"]),
+      GetAsyncKeyState: u.func("GetAsyncKeyState", "int16", ["int"]),
+      SetWindowDisplayAffinity: u.func("SetWindowDisplayAffinity", "bool", ["void *", "uint32"]),
+      /* 判"现在前台是不是桌面本体"用（见 fgIsDesktop） */
+      GetForegroundWindow: u.func("GetForegroundWindow", "void *", []),
+      GetClassNameW: u.func("GetClassNameW", "int", ["void *", "uint16_t *", "int"]),
+    };
+  } catch (e) { return null; }
+})();
+const WDA_EXCLUDE = 0x11;   /* WDA_EXCLUDEFROMCAPTURE：对屏幕捕获隐身、照常显示 */
+
+const SWP_DRAG = 0x0001 | 0x0004 | 0x0010;   /* NOSIZE | NOZORDER | NOACTIVATE */
+/* 缩放不能用 SWP_DRAG：它带 SWP_NOSIZE，宽高会被忽略，
+   结果只有 zoomFactor 变了、窗口没变 → 卡片被裁掉一圈（实测踩过）。 */
+const SWP_RESIZE = 0x0004 | 0x0010;          /* NOZORDER | NOACTIVATE */
+const DRAG_THRESHOLD = 4;                    /* 物理像素，手抖不算拖 */
+
+function hwndNum(win) {
+  try {
+    const b = win.getNativeWindowHandle();
+    return b.length >= 8 ? Number(b.readBigUInt64LE(0)) : b.readUInt32LE(0);
+  } catch (e) { return 0; }
+}
+
+/* ================= 搜索层的两个"系统级"出口 =================
+   以前退出搜索有两条路，都在页面里：
+     · ESC —— document keydown；
+     · 点桌面空白 —— 窗口失焦 → window blur。
+   贴进桌面层之后两条全断了：卡片成了 Progman 的子窗口，
+   既拿不到键盘焦点（一个 keydown 都收不到），也不存在"失焦"这回事
+   （它没有前台身份，点桌面不会让它 blur）。用户就这么被关在搜索页里出不来。
+
+   所以这活儿挪到主进程：搜索层开着的时候 40ms 轮一次
+     · ESC 的上升沿
+     · 左键的上升沿 + 光标不在窗口矩形里
+   命中就通知页面 closeSearch。页面里还留着右上角的叉做第三道保险。 */
+/* ================= 桌面快照背景（与待办卡同款，见 backdrop.js 头注释） =================
+   半透明处要"透出桌面图标"，桌面层里真透明只能透壁纸，所以把快照垫在卡片底下。
+   这里只管裁剪/下发，抓图在 backdrop.js。 */
+let BD = null;
+let bdTimer = null;
+const BD_PAD = 44;
+
+const hwndOf = (w) => {
+  try {
+    const b = w.getNativeWindowHandle();
+    return b.length >= 8 ? Number(b.readBigUInt64LE(0)) : b.readUInt32LE(0);
+  } catch (e) { return 0; }
+};
+
+function bdPayload() {
+  const w = cardWin;
+  if (!w || w.isDestroyed() || !BD || !BD.has()) return null;
+  const b = w.getBounds();
+  let dpi = 1, zoom = 1;
+  try { dpi = screen.getDisplayMatching(b).scaleFactor || 1; } catch (e) {}
+  try { zoom = w.webContents.getZoomFactor() || 1; } catch (e) {}
+  const s = dpi * zoom;               /* 物理 px ↔ CSS px 的总比例 */
+  return BD.patch(
+    { x: b.x * dpi, y: b.y * dpi, width: b.width * dpi, height: b.height * dpi },
+    s, BD_PAD
+  );
+}
+
+function pushBackdrop(delay) {
+  clearTimeout(bdTimer);
+  bdTimer = setTimeout(() => {
+    const w = cardWin;
+    if (!w || w.isDestroyed()) return;
+    if (w.__drag) return;                 /* 拖动中位置一直在变，松手后再给 */
+    const p = bdPayload();
+    if (!p) return;
+    try { w.webContents.send("wgt:backdrop", p); } catch (e) {}
+  }, delay == null ? 160 : delay);
+}
+
+/* 拖动中专用：无视 __drag 闸门立刻裁一块推给页面（拖动实况背景靠它） */
+function pushBackdropNow() {
+  const w = cardWin;
+  if (!w || w.isDestroyed()) return;
+  const p = bdPayload();
+  if (!p) return;
+  try { w.webContents.send("wgt:backdrop", p); } catch (e) {}
+}
+
+/* 拖动实况背景：整幅快照一次性下发（PNG 几 MB，一次拖动只发一回；
+   页面缓存 blob）。拖动中每 tick 只发窗口坐标，页面自己挪整幅快照 ——
+   旧方案每 70ms 重裁一块，两次推送之间卡片动了背景没动，拖快了错位。 */
+function sendBdFull(w) {
+  if (!BD || !BD.has() || !w || w.isDestroyed()) return false;
+  const f = BD.full();
+  const png = BD.image();
+  if (!f || !png) return false;
+  try { w.webContents.send("wgt:bd-full", { png, ox: f.ox, oy: f.oy, w: f.w, h: f.h }); return true; }
+  catch (e) { return false; }
+}
+
+function setCaptureAffinity(w, on) {
+  if (!_drg || !_drg.SetWindowDisplayAffinity) return false;
+  const hwnd = w && !w.isDestroyed() ? hwndOf(w) : 0;
+  if (!hwnd) return false;
+  try { return !!_drg.SetWindowDisplayAffinity(hwnd, on ? WDA_EXCLUDE : 0); } catch (e) { return false; }
+}
+
+function refreshSnapshot(reason) {
+  const w = cardWin;
+  if (!w || w.isDestroyed() || !BD) return false;
+  if (w.__drag) return false;
+  const wda = setCaptureAffinity(w, true);
+  let ok = false;
+  try {
+    ok = BD.capture({ hide: !wda, noHide: wda });
+  } finally {
+    if (wda) setCaptureAffinity(w, false);
+  }
+  if (ok) pushBackdrop(40);
+  try {
+    appendLog(
+      new Date().toISOString() + ` snapshot ${ok ? "OK" : "FAIL"} wda=${wda} (${reason || ""})\n`);
+  } catch (e) {}
+  return ok;
+}
+
+/* 背景"实时"化：★ v1.0.17 重做（原因：卡片会在桌面上"闪一下"）
+   抓一张"干净桌面"必须让卡片消失 60~70ms —— WDA_EXCLUDEFROMCAPTURE 对
+   Progman 子窗口无效（实测 wda=false），只能退回 SW_HIDE。所以关键不在
+   "怎么抓"而在"多久抓一次"。旧策略是"20 秒无条件抓一次 + 每次松开鼠标都抓"，
+   等于卡片每 20 秒自己消失一下。现在按事件抓：
+     · 换壁纸（TranscodedWallpaper 的 mtime 变了）→ 抓（用户正在设置界面里，
+       桌面被挡住，看不见闪）；
+     · 改分辨率 / 缩放 → 抓；
+     · 在**桌面上**松开左键 → 抓，60 秒最多一次；
+     · 点应用窗口 → 不抓（卡片被盖着，抓了也看不见）；
+     · 手动菜单「刷新桌面背景」→ 抓。 */
+let _snapT = null, _snapLast = 0;
+
+const _fgClsBuf = Buffer.alloc(512);
+const DESK_FG_CLASSES = ["Progman", "WorkerW", "SHELLDLL_DefView", "SysListView32"];
+
+function fgIsDesktop() {
+  if (!_drg || !_drg.GetForegroundWindow) return false;
+  try {
+    const n = _drg.GetClassNameW(_drg.GetForegroundWindow(), _fgClsBuf, 256);
+    if (!(n > 0)) return false;
+    return DESK_FG_CLASSES.indexOf(_fgClsBuf.toString("utf16le", 0, n * 2)) >= 0;
+  } catch (e) { return false; }
+}
+
+const wallpaperFile = () =>
+  path.join(app.getPath("appData"), "Microsoft", "Windows", "Themes", "TranscodedWallpaper");
+function wallpaperStamp() {
+  /* 修改时间 + 大小：Windows 换壁纸会重写 TranscodedWallpaper，
+     两个值一起比，比只看 mtime 更稳（同一张图重新应用也能识别）。 */
+  try {
+    const s = fs.statSync(wallpaperFile());
+    return (s.mtimeMs || 0) + ":" + (s.size || 0);
+  } catch (e) { return 0; }
+}
+
+function scheduleSnapshot(delay, reason) {
+  clearTimeout(_snapT);
+  _snapT = setTimeout(() => {
+    const now = Date.now();
+    if (now - _snapLast < 900) return;
+    _snapLast = now;
+    refreshSnapshot(reason);
+  }, delay == null ? 400 : delay);
+}
+
+let _clickSnap = 0, _wpStamp = 0;
+
+let editingNow = false;   /* 页面正在双击改时间 */
+
+function startDesktopWatch() {
+  if (!_drg) return;
+  _wpStamp = wallpaperStamp();
+
+  let prev = false;
+  setInterval(() => {
+    const down = (_drg.GetAsyncKeyState(0x01) & 0x8000) !== 0;
+    if (down === prev) return;
+    prev = down;
+    if (down) return;
+    const w = cardWin;
+    if (!w || w.isDestroyed() || w.__drag) return;
+    const p = screen.getCursorScreenPoint(), b = w.getBounds();
+    if (p.x >= b.x && p.x < b.x + b.width && p.y >= b.y && p.y < b.y + b.height) return;
+    if (!fgIsDesktop()) return;
+    /* 正在改时间时，点桌面空白 = "确定"（桌面层里窗口不会失焦，
+       页面自己收不到这个点击，只能主进程代听） */
+    if (editingNow) {
+      editingNow = false;
+      try { w.webContents.send("timer:commit-edit"); } catch (e) {}
+      return;
+    }
+    const now = Date.now();
+    if (now - _clickSnap < 60000) return;
+    _clickSnap = now;
+    scheduleSnapshot(400, "desktop-click");
+  }, 60);
+
+  setInterval(() => {
+    const s = wallpaperStamp();
+    if (!s || s === _wpStamp) return;
+    _wpStamp = s;
+    scheduleSnapshot(500, "wallpaper");
+  }, 2000);
+
+  try { screen.on("display-metrics-changed", () => scheduleSnapshot(800, "metrics")); } catch (e) {}
+
+  if (!_wpStamp) setInterval(() => scheduleSnapshot(0, "tick"), 600000);
+}
+
+/* ================= 窗口圆角裁剪（SetWindowRgn） =================
+   症状：四角出现黑色三角。来源：卡片圆角外的像素是"没画的 alpha=0"，桌面层
+   子窗口合成时这些像素变黑（DWM 的 DONOTROUND 属性对子窗口设置直接 E_HANDLE，
+   没法用）。办法与待办卡同款：把窗口裁成圆角矩形，弧线外的像素根本不存在。
+   只裁卡片本体 —— 四周 22px 自绘投影边距会被裁掉，桌面层里本来也看不见它。 */
+const _rgn = (() => {
+  try {
+    const k = require("koffi");
+    const u = k.load("user32.dll"), g = k.load("gdi32.dll");
+    return {
+      SetWindowRgn: u.func("SetWindowRgn", "int", ["void *", "void *", "bool"]),
+      GetWindowRgn: u.func("GetWindowRgn", "int", ["void *", "void *"]),
+      CreateRoundRectRgn: g.func("CreateRoundRectRgn", "void *", ["int", "int", "int", "int", "int", "int"]),
+      DeleteObject: g.func("DeleteObject", "bool", ["void *"]),
+    };
+  } catch (e) { return null; }
+})();
+
+function applyCardRegion(w, force) {
+  /* 只在区域真的存在时才清，避免每 3 秒一次多余的 SetWindowRgn 重绘 */
+  const clearRegion = () => {
+    try {
+      const probe = _rgn.CreateRoundRectRgn(0, 0, 1, 1, 1, 1);
+      const had = _rgn.GetWindowRgn(hwndOf(w), probe);
+      _rgn.DeleteObject(probe);
+      if (had > 0) _rgn.SetWindowRgn(hwndOf(w), null, true);
+    } catch (e) {}
+  };
+
+  /* ★ 只有"不透明窗口"才需要硬裁窗口区域（acrylic 模式下页面 alpha=0 的角落
+     会露出窗口底色）。透明窗口一律不设区域：
+       · 普通模式 → 圆角交给 .card 的 border-radius，边缘带 alpha 渐变，没有台阶；
+       · 桌面层   → 子窗口里 alpha=0 会渲染成黑色，所以让 #bd 快照铺满整窗
+                    （页面里 body.dlayer 取消了 clip-path），圆角外那圈显示的就是
+                    "桌面本身"，同样由 border-radius 抗锯齿过渡。
+     SetWindowRgn 是 1 位掩码、没有抗锯齿，能不设就不设。 */
+  if (!USE_ACRYLIC) {
+    clearRegion();
+    try { w.webContents.send("wgt:noreg", false); } catch (e) {}
+    return;
+  }
+  try { w.webContents.send("wgt:noreg", false); } catch (e) {}
+  if (!_rgn || !w || w.isDestroyed()) return;
+  /* ★ 不强制时先问一句"区域还在不在"。
+     SetParent 挂进 Progman 会把窗口区域冲掉（实测：挂之前 GetWindowRgn=2，
+     挂之后变 0，四个角就露出来了），所以要能在挂完之后补设一次。
+     已有的区域还在就跳过，避免每 3 秒重建一次导致闪。 */
+  if (!force) {
+    try {
+      const probe = _rgn.CreateRoundRectRgn(0, 0, 1, 1, 1, 1);
+      const had = _rgn.GetWindowRgn(hwndOf(w), probe);
+      _rgn.DeleteObject(probe);
+      if (had > 0) return;
+    } catch (e) { /* 查不到就当没有，照常设 */ }
+  }
+  const b = w.getBounds();
+  let dpi = 1, zoom = 1;
+  try { dpi = screen.getDisplayMatching(b).scaleFactor || 1; } catch (e) {}
+  try { zoom = w.webContents.getZoomFactor() || 1; } catch (e) {}
+  const s = dpi * zoom;
+  /* ★ 裁切矩形必须等于"卡片真实占的地方"，不是窗口减 PAD。
+     页面里 .card 是 position:absolute; inset:0 —— 卡片铺满整个窗口，
+     并没有给投影留边距（#bd 才是往外扩 44px 那层）。
+     原来按 PAD=22 缩进，实测把卡片四边各切掉 22 CSS px（窗口 582x598，
+     可见区域只有 512x528），连左右两边的文字都被切了 —— 用户看到的"显示不全"。
+     磨砂模式 PAD 本来就是 0，所以只有"贴进桌面"这条路上会犯。 */
+  const m = 0;
+  const W = Math.round(b.width * dpi), H = Math.round(b.height * dpi);
+  /* ★ 必须和 CSS 里 .card 的 border-radius 一致（现在是 30px）。
+     之前写的是 24：窗口区域比卡片更"方"，四个角就会露出卡片没画到的那一小块，
+     看起来就是"边角多出四个角"。改圆角时这两处要一起改。 */
+  const rad = Math.max(2, Math.round((layoutIsWide() ? WIDE_RAD : 30) * s));
+  let hrgn = 0;
+  try {
+    /* ★ 最后两个参数是"椭圆的长和宽"，不是半径 —— 圆角半径 = 这个值 / 2。
+       一直传 rad，实际圆角只有 15px，而 CSS 是 30px：窗口区域比卡片"方"了 15px，
+       四个角就露出一条弧形的缝（拖动时最明显，缝里是底下的桌面快照）。 */
+    hrgn = Number(_rgn.CreateRoundRectRgn(
+      m, m, W - m + 1, H - m + 1, rad * 2, rad * 2));
+    if (hrgn) _rgn.SetWindowRgn(hwndOf(w), hrgn, true);
+  } catch (e) {}
+}
+
+/* ================= 四角拖拽缩放 =================
+   只做等比：页面用 zoomFactor 整体放大，所以布局、圆角、字号都不用重算。
+   角在右边 → 宽度跟着光标走；角在左边 → 左边界跟着走、宽高反算。
+   高度永远按 CARD_H/CARD_W 的比例算，避免拉扁变形。 */
+function resizeStop(w) {
+  if (!w || !w.__rz) return;
+  const st = w.__rz;
+  clearInterval(st.timer);
+  w.__rz = null;
+  try {
+    const z = Number(st.lastZ);
+    if (Number.isFinite(z) && z >= SCALE_MIN - 0.001) {
+      const b = w.getBounds();
+      patchState({ scale: z, x: b.x, y: b.y });
+    }
+  } catch (e) {}
+}
+
+/* 四角缩放 —— 照天气卡的做法：用 Electron 的 screen.getCursorScreenPoint() + setBounds()。
+   之前这版用 koffi 的 GetCursorPos / SetWindowPos，开头还有一句 `if (!_drg) return;`，
+   而 _drg 只在"贴进桌面层"时才初始化 —— 所以一旦勾了置顶（脱离桌面层），
+   拖角直接 return，表现就是"尺寸调不了，只有内容在缩放"。 */
+function resizeBegin(w, corner) {
+  resizeStop(w);
+  if (!w || w.isDestroyed()) return;
+  const b = w.getBounds();
+  const p0 = screen.getCursorScreenPoint();          /* Electron 给的是 DIP */
+  const CS = cardSize();                             /* 宽高比跟布局走 */
+  const st = {
+    corner,
+    ox: b.x, oy: b.y, ow: b.width, oh: b.height,
+    cx: p0.x, cy: p0.y,
+    baseW: CS.w + PAD * 2,
+    ratio: CS.h / CS.w,
+    timer: null,
+  };
+  w.__rz = st;
+  st.timer = setInterval(() => {
+    if (w.isDestroyed()) { resizeStop(w); return; }
+    const p = screen.getCursorScreenPoint();
+    const dx = p.x - st.cx;
+    const right = corner === "tr" || corner === "br";
+    const bottom = corner === "bl" || corner === "br";
+    const z = Math.min(SCALE_MAX, Math.max(SCALE_MIN, (st.ow + (right ? dx : -dx)) / st.baseW));
+    const nw = Math.round(st.baseW * z);
+    const nh = Math.round(st.baseW * st.ratio * z);
+    const nx = right ? st.ox : st.ox + (st.ow - nw);
+    const ny = bottom ? st.oy : st.oy + (st.oh - nh);
+    st.lastZ = z;
+    try {
+      w.webContents.setZoomFactor(z);
+      w.setBounds({ x: nx, y: ny, width: nw, height: nh });
+      applyCardRegion(w, true);
+    } catch (e) {}
+  }, 16);
+}
+
+/* ================= 置顶（菜单和图钉共用） =================
+   贴进桌面层时卡片是 Progman 的子窗口，setAlwaysOnTop 对子窗口无效 ——
+   所以"置顶"必须先把卡片从桌面层摘出来，两者互斥。 */
+async function setTopState(w, want) {
+  const on = !!want;
+  patchState({ top: on, desktopLayer: !on });
+  if (!w || w.isDestroyed()) return on;
+  if (on) {
+    try { if (DL && DL.isOn && DL.isOn()) await DL.set(false); } catch (e) {}
+    try { w.setAlwaysOnTop(true, "floating"); } catch (e) {}
+  } else {
+    try { w.setAlwaysOnTop(false); } catch (e) {}
+    try { if (DL) await DL.set(true); } catch (e) {}
+  }
+  try { w.webContents.send("wgt:top", on); } catch (e) {}
+  /* 页面据此换模式：置顶模式不画桌面快照（走真透明，圆角一定干净） */
+  try { w.webContents.send("wgt:dlayer", !on); } catch (e) {}
+  applyCardRegion(w);
+  return on;
+}
+
+/* ================= 外观浮窗 =================
+   卡片只有 260x240，面板放里面必然挡住内容、边角还会被圆角裁掉。
+   所以做成一个独立小窗，贴在卡片外侧；失焦自动关。 */
+let lookWin = null;
+
+function closeLookWin() {
+  if (!lookWin || lookWin.isDestroyed()) { lookWin = null; return; }
+  try { lookWin.close(); } catch (e) {}
+  lookWin = null;
+}
+
+function openLookWin() {
+  if (lookWin && !lookWin.isDestroyed()) { lookWin.focus(); return; }
+  const cw = cardWin;
+  if (!cw || cw.isDestroyed()) return;
+
+  const W = 260, H = 300, GAP = 10;
+  const b = cw.getBounds();
+  let d = screen.getDisplayMatching(b);
+  const a = d.workArea;
+
+  /* 默认贴在卡片下面、水平居中；下面放不下就放上面 */
+  let x = Math.round(b.x + (b.width - W) / 2);
+  let y = b.y + b.height + GAP;
+  if (y + H > a.y + a.height - 6) y = b.y - H - GAP;      /* 下面没地方 → 放上面 */
+  x = Math.min(Math.max(x, a.x + 6), a.x + a.width - W - 6);
+  y = Math.min(Math.max(y, a.y + 6), a.y + a.height - H - 6);
+
+  lookWin = new BrowserWindow({
+    width: W, height: H, x: Math.round(x), y: Math.round(y),
+    frame: false, transparent: true, backgroundColor: "#00000000",
+    resizable: false, minimizable: false, maximizable: false, fullscreenable: false,
+    skipTaskbar: true, alwaysOnTop: true, hasShadow: false,
+    show: false,
+    webPreferences: {
+      preload: path.join(__dirname, "look-preload.js"),
+      contextIsolation: true, nodeIntegration: false,
+      additionalArguments: ["--wgt-theme=" + resolvedTheme()],
+    },
+  });
+  lookWin.loadFile(path.join(__dirname, "look.html"));
+  lookWin.once("ready-to-show", () => { try { lookWin.show(); } catch (e) {} });
+  lookWin.on("blur", () => closeLookWin());     /* 点别处就收起 */
+  lookWin.on("closed", () => { lookWin = null; });
+}
+
+function toggleLookWin() {
+  if (lookWin && !lookWin.isDestroyed()) closeLookWin();
+  else openLookWin();
+}
+
+/* ================= 提示音浮窗 =================
+   和外观浮窗同一套路：卡片只有 260x240（mini 态更小），把 6 个音色塞进卡片里
+   字会小到看不清。所以整块搬到卡片外侧的独立小窗，绝不和卡片重叠。
+   优先级：右侧 → 左侧 → 下面 → 上面（哪边放得下就放哪边）。 */
+let soundWin = null;
+
+function closeSoundWin() {
+  if (!soundWin || soundWin.isDestroyed()) { soundWin = null; return; }
+  try { soundWin.close(); } catch (e) {}
+  soundWin = null;
+}
+
+function openSoundWin() {
+  if (soundWin && !soundWin.isDestroyed()) { soundWin.focus(); return; }
+  const cw = cardWin;
+  if (!cw || cw.isDestroyed()) return;
+
+  const W = 252, H = 244, GAP = 10;
+  const b = cw.getBounds();
+  const a = screen.getDisplayMatching(b).workArea;
+
+  let x = b.x + b.width + GAP;
+  let y = b.y;
+  if (x + W > a.x + a.width - 6) {          /* 右边放不下 → 试左边 */
+    x = b.x - W - GAP;
+    if (x < a.x + 6) {                       /* 左边也放不下 → 放下面 */
+      x = Math.round(b.x + (b.width - W) / 2);
+      y = b.y + b.height + GAP;
+      if (y + H > a.y + a.height - 6) y = b.y - H - GAP;   /* 下面也放不下 → 放上面 */
+    }
+  }
+  x = Math.min(Math.max(x, a.x + 6), a.x + a.width - W - 6);
+  y = Math.min(Math.max(y, a.y + 6), a.y + a.height - H - 6);
+
+  soundWin = new BrowserWindow({
+    width: W, height: H, x: Math.round(x), y: Math.round(y),
+    frame: false, transparent: true, backgroundColor: "#00000000",
+    resizable: false, minimizable: false, maximizable: false, fullscreenable: false,
+    skipTaskbar: true, alwaysOnTop: true, hasShadow: false,
+    show: false,
+    webPreferences: {
+      preload: path.join(__dirname, "sound-preload.js"),
+      contextIsolation: true, nodeIntegration: false,
+      additionalArguments: [
+        "--wgt-theme=" + resolvedTheme(),
+        "--wgt-sounds=" + encodeURIComponent(JSON.stringify(ALARM_SOUNDS)),
+      ],
+    },
+  });
+  soundWin.loadFile(path.join(__dirname, "sound.html"));
+  soundWin.once("ready-to-show", () => { try { soundWin.show(); } catch (e) {} });
+  soundWin.on("blur", () => closeSoundWin());
+  soundWin.on("closed", () => { soundWin = null; });
+}
+
+function toggleSoundWin() {
+  if (soundWin && !soundWin.isDestroyed()) closeSoundWin();
+  else openSoundWin();
+}
+
+/* 切换 方形 / 横版：改窗口尺寸 + 圆角区域 + 通知页面。不重启。 */
+function applyLayout(w) {
+  if (!w || w.isDestroyed()) return;
+  const CS = cardSize();
+  const b = w.getBounds();
+  const z = readScale();
+  const nw = Math.round((CS.w + PAD * 2) * z);
+  const nh = Math.round((CS.h + PAD * 2) * z);
+  try {
+    w.setBounds({ x: b.x, y: b.y, width: nw, height: nh });
+    w.webContents.setZoomFactor(z);
+    w.webContents.send("wgt:layout", layoutIsWide() ? "wide" : "full");
+    applyCardRegion(w, true);
+    pushBackdrop(160);
+  } catch (e) {}
+}
+
+function dragBegin(w) {
+  dragStop(w, false);
+  if (!_drg) return;
+  const hwnd = hwndNum(w);
+  const cb = Buffer.alloc(8), rb = Buffer.alloc(16);
+  if (!hwnd || !_drg.GetCursorPos(cb) || !_drg.GetWindowRect(hwnd, rb)) return;
+  const st = {
+    hwnd,
+    ox: rb.readInt32LE(0), oy: rb.readInt32LE(4),
+    cx: cb.readInt32LE(0), cy: cb.readInt32LE(4),
+    moving: false,
+    timer: null,
+  };
+  w.__drag = st;
+  /* 拖动实况背景（整幅快照方案）：起拖把整幅快照一次性发给页面，页面把它
+     按屏幕坐标"钉死"在桌面上，之后每个 tick 只发一个窗口坐标 —— 背景不动、
+     窗口在上面滑，像素级对齐。旧方案每 70ms 重裁一块，两次推送之间卡片
+     动了背景没动，拖快了背景错位（用户报的"透明时和背景没对齐"）。
+     快照是干净的（启动/20s 兜底抓的没有卡片自己），起手不抓图不闪屏。 */
+  st.bd = !!(BD && BD.has());
+  if (st.bd) {
+    sendBdFull(w);
+    try { w.webContents.send("wgt:bd-pos", { x: st.ox, y: st.oy }); } catch (e) { }
+  }
+  st.timer = setInterval(() => {
+    if (w.isDestroyed()) { dragStop(w, true); return; }
+    if ((_drg.GetAsyncKeyState(0x01) & 0x8000) === 0) { dragStop(w, true); return; }
+    const c = Buffer.alloc(8);
+    if (!_drg.GetCursorPos(c)) return;
+    const dx = c.readInt32LE(0) - st.cx;
+    const dy = c.readInt32LE(4) - st.cy;
+    if (!st.moving) {
+      if (Math.abs(dx) < DRAG_THRESHOLD && Math.abs(dy) < DRAG_THRESHOLD) return;
+      st.moving = true;
+    }
+    try { _drg.SetWindowPos(st.hwnd, 0, st.ox + dx, st.oy + dy, 0, 0, SWP_DRAG); } catch (e) { }
+    /* 拖动实况背景：只发窗口新坐标，页面自己挪整幅快照（与窗口同源同步） */
+    if (st.bd) { try { w.webContents.send("wgt:bd-pos", { x: st.ox + dx, y: st.oy + dy }); } catch (e) { } }
+  }, 8);
+}
+
+function dragStop(w, persist) {
+  const st = w.__drag;
+  if (!st) return;
+  clearInterval(st.timer);
+  w.__drag = null;
+  /* 拖动结束：让页面退出"整幅快照钉桌面"模式（随后 patch 载荷来重设 #bd） */
+  if (st.bd) { try { w.webContents.send("wgt:bd-drag-end"); } catch (e) { } }
+  /* 位置由原生 SetWindowPos 改的，等不到 moved 事件，必须自己落盘 */
+  if (persist && w && !w.isDestroyed()) {
+    const b = w.getBounds();
+    patchState({ x: b.x, y: b.y });
+    pushBackdrop(140);          /* 换位置了，快照重新裁一块 */
+  }
+}
+
+/* ================= 桌面层输入桥（幽灵输入窗） =================
+   卡片贴进桌面层后是 Progman 的子窗口 —— 子窗口永远进不了前台输入队列，
+   键盘（含输入法）一个字都到不了页面，搜索框就成了摆设。
+   解法：开一个**真顶层窗口**（能正常拿焦点、能起输入法），透明隐形，
+   贴在搜索框的位置上代收打字，再把文字实时镜像回卡片。
+   普通窗口模式键盘本来就是通的，主进程直接忽略 ime-begin。 */
+let imeWin = null;        /* 幽灵输入窗（懒创建，常驻复用） */
+let imeTarget = null;     /* 正在代收的那张卡片窗口 */
+let imeHiding = false;    /* 自己 hide() 触发的 blur，别当成"用户点走了" */
+
+function imeEnsure() {
+  if (imeWin && !imeWin.isDestroyed()) return imeWin;
+  imeWin = new BrowserWindow({
+    width: 8, height: 8,
+    frame: false, transparent: true, backgroundColor: "#00000000",
+    resizable: false, movable: false, minimizable: false, maximizable: false,
+    fullscreenable: false, skipTaskbar: true, hasShadow: false,
+    show: false, alwaysOnTop: true,
+    title: "输入桥",
+    webPreferences: {
+      preload: path.join(__dirname, "ime-preload.js"),
+      contextIsolation: true, nodeIntegration: false,
+      backgroundThrottling: false,
+    },
+  });
+  imeWin.setMenu(null);
+  imeWin.__loaded = false;
+  imeWin.webContents.on("did-finish-load", () => {
+    imeWin.__loaded = true;
+    if (imeWin.__pending != null) {
+      try { imeWin.webContents.send("ime:init", imeWin.__pending); } catch (e) {}
+      imeWin.__pending = null;
+    }
+  });
+  imeWin.loadFile(path.join(__dirname, "ime.html"));
+  return imeWin;
+}
+
+/* 幽灵窗必须真正拿到系统前台，键盘才进得来。Windows 默认拒绝后台进程
+   抢前台 —— 经典解锁手法：空按一次 ALT，系统就允许本进程把前台要回来。
+   正常情况下用户刚点过卡片，第一次 focus 就能成；这里只是兜底。 */
+function imeForceFocus(g) {
+  let fgMe = false;
+  try {
+    const u = require("koffi").load("user32.dll");
+    const GetForegroundWindow = u.func("GetForegroundWindow", "void *", []);
+    const GetWindowThreadProcessId = u.func("GetWindowThreadProcessId", "uint32", ["void *", "uint32 *"]);
+    const keybd_event = u.func("keybd_event", "void", ["uint8", "uint8", "uint32", "void *"]);
+    const pidBuf = Buffer.alloc(4);
+    const fgPid = () => {
+      const fg = GetForegroundWindow();
+      if (!fg) return 0;
+      GetWindowThreadProcessId(fg, pidBuf);
+      return pidBuf.readUInt32LE(0);
+    };
+    fgMe = fgPid() === process.pid;
+    if (!fgMe) {
+      keybd_event(0x12, 0, 0, null);       /* ALT down */
+      keybd_event(0x12, 0, 2, null);       /* ALT up（KEYEVENTF_KEYUP） */
+      try { g.focus(); } catch (e) {}
+      fgMe = fgPid() === process.pid;
+    }
+  } catch (e) {}
+  return fgMe;
+}
+
+function imeHide() {
+  imeHiding = true;
+  if (imeWin && !imeWin.isDestroyed()) {
+    try { imeWin.hide(); } catch (e) {}
+  }
+  setTimeout(() => { imeHiding = false; }, 150);
+}
+
+function imeRelay(ch, v) {
+  const w = imeTarget;
+  if (!w || w.isDestroyed()) return;
+  try { w.webContents.send(ch, v); } catch (e) {}
+}
+
+/* 在 app ready 之后注册一次（not per window） */
+function registerImeIpc() {
+  ipcMain.on("wgt:ime-begin", (e, r) => {
+    const w = BrowserWindow.fromWebContents(e.sender);
+    if (!w || w.isDestroyed()) return;
+    if (desktopLayerOn() !== true) return;   /* 普通窗口模式键盘是通的 */
+    const o = (r && typeof r === "object") ? r : {};
+    const b = w.getBounds();
+    /* 页面报的是窗口内 CSS px；本卡带 zoomFactor 缩放，css÷z=dip */
+    let z = 1;
+    try { z = w.webContents.getZoomFactor() || 1; } catch (er) {}
+    const rect = {
+      x: Math.round(b.x + (Number(o.x) || 0) / z),
+      y: Math.round(b.y + (Number(o.y) || 0) / z),
+      width: Math.max(8, Math.round((Number(o.w) || 8) / z)),
+      height: Math.max(8, Math.round((Number(o.h) || 8) / z)),
+    };
+    const g = imeEnsure();
+    imeTarget = w;
+    try { g.setBounds({ x: rect.x, y: rect.y, width: rect.width, height: rect.height }); } catch (er) {}
+    const val = String(o.value || "");
+    if (g.__loaded) {
+      /* 幽灵窗常驻复用：隐藏着也要把预填值送过去，否则上次输入的文字
+         会残留在框里，新一次打字接着旧文字往后拼。 */
+      try { g.webContents.send("ime:init", val); } catch (er) {}
+    } else {
+      g.__pending = val;      /* 首次创建还没加载完，等 did-finish-load 再送 */
+    }
+    g.show();
+    try { g.focus(); } catch (er) {}
+    imeForceFocus(g);
+  });
+  ipcMain.on("wgt:ime-end", () => { imeHide(); imeTarget = null; });
+  ipcMain.on("ime:text", (_e, v) => { if (!imeHiding) imeRelay("timer:ime-text", String(v == null ? "" : v)); });
+  ipcMain.on("ime:commit", () => { imeHide(); imeRelay("timer:ime-commit"); });
+  ipcMain.on("ime:cancel", () => { imeHide(); imeRelay("timer:ime-cancel"); });
+  ipcMain.on("ime:blur", () => {
+    if (imeHiding) return;               /* 自己藏起来的不算失焦 */
+    imeHide();
+    imeRelay("timer:ime-blur");
+  });
+}
+
+/* ================= 卡片大小（等比缩放） =================
+   做法：窗口尺寸 × z，同时 webContents 的 zoomFactor = z。
+   页面是按"基准视口"排版的：窗口 DIP 宽 = 基准 × z，除以 zoomFactor 之后
+   页面拿到的 CSS 宽还是基准值，于是字号、间距、图标跟着一起等比放大 ——
+   而不是"框变大了、字还是原来那么大"。
+
+   为什么不干脆 resizable:true 让用户拖边：
+     卡片没有边框可抓，而且桌面层里窗口是 Progman 的子窗口，系统那套
+     resize 边和标题栏拖动一样不工作（拖动已经因此改成自己实现了）。
+     给档位菜单 + Ctrl+滚轮，两个入口都不依赖系统。
+
+   缩放锚点是卡片中心：放大时四周均匀外扩，不会只往右下长。
+   存 state.scale，重启后按原大小打开。 */
+
+/* 缩放的痕迹单独记一笔：出问题（尺寸不对、位置跑掉）时能一眼看到调了什么 */
+function scaleLog(msg) {
+  try {
+    appendLog(
+      new Date().toISOString() + " " + msg + "\n");
+  } catch (e) { /* 日志失败不影响功能 */ }
+}
+
+
+/* ---------- 首次启动迁移 ----------
+   存档在 %APPDATA%\TimerCard。
+   第一次启动把合体版的窗口位置/置顶搬过来；Local Storage（搜索城市等页面数据）
+   也整个目录复制过去。已有自己的存档就不动。 */
+function createWindow() {
+  if (cardWin && !cardWin.isDestroyed()) {   /* 已经在跑就只唤到前面，不开第二个 */
+    if (cardWin.isMinimized()) cardWin.restore();
+    cardWin.show();
+    cardWin.focus();
+    /* ★ 桌面层里它是 Progman 的子窗口，show()/focus() 压不过前面的窗口 ——
+       用户双击图标看起来"什么都没发生"。临时置顶 1.8 秒让人看见它在哪，再按设置恢复。 */
+    try {
+      cardWin.setAlwaysOnTop(true, "floating");
+      setTimeout(() => {
+        try {
+          if (!cardWin.isDestroyed() && readState().top !== true) cardWin.setAlwaysOnTop(false);
+        } catch (e) {}
+      }, 1800);
+    } catch (e) {}
+    return cardWin;
+  }
+
+  const z = readScale();
+  const CS = cardSize();
+  try {
+    appendLog(
+      new Date().toISOString() + ` scale resolved=${z} raw=${JSON.stringify(readState().scale)}\n`);
+  } catch (e) {}
+  const WIN_W = Math.round((CS.w + PAD * 2) * z);
+  const WIN_H = Math.round((CS.h + PAD * 2) * z);
+
+  const st = readState();
+  const wa = screen.getPrimaryDisplay().workArea;
+  const top = st.top === true;   /* 默认不置顶：卡片安静待在桌面上，不压在其他窗口前面 */
+
+  /* 默认贴右上角 */
+  const defX = wa.x + wa.width - WIN_W - 24;
+  const defY = wa.y + 54;
+
+  let x = Number.isFinite(st.x) ? st.x : defX;
+  let y = Number.isFinite(st.y) ? st.y : defY;
+
+  /* 位置兜底：换显示器、拔掉副屏、或系统把窗口挪到边缘时，
+     旧坐标可能让卡片贴边甚至跑到屏幕外。这里强制夹回可视区内并留出边距。 */
+  const MARGIN = 14;
+  const target = screen.getAllDisplays().find((d) => {
+    const a = d.workArea;
+    return x + WIN_W / 2 >= a.x && x + WIN_W / 2 <= a.x + a.width &&
+           y + WIN_H / 2 >= a.y && y + WIN_H / 2 <= a.y + a.height;
+  }) || screen.getPrimaryDisplay();
+
+  const ta = target.workArea;
+  x = Math.min(Math.max(x, ta.x + MARGIN), ta.x + ta.width - WIN_W - MARGIN);
+  y = Math.min(Math.max(y, ta.y + MARGIN), ta.y + ta.height - WIN_H - MARGIN);
+
+  const w = new BrowserWindow({
+    width: WIN_W,
+    height: WIN_H,
+    x: x,
+    y: y,
+    frame: false,
+    /* 磨砂与"透明窗口"在 Windows 上二选一：
+       acrylic 走系统绘制，需要非透明窗口 + 全透明背景色。
+       透明窗口那边连 backgroundMaterial 字段都不能带 —— 带着（哪怕是 "none"）
+       窗口仍会走材质合成路径，页面内容会被压成几乎看不见的一层。 */
+    transparent: !USE_ACRYLIC,
+    backgroundColor: "#00000000",
+    roundedCorners: false,     /* Win11 给透明窗口自动加系统圆角，弧线外填黑（四角黑三角） */
+    ...(USE_ACRYLIC ? { backgroundMaterial: "acrylic" } : {}),
+    hasShadow: false,          // 无边框窗口自带阴影会把直角露出来
+    resizable: false,
+    maximizable: false,
+    minimizable: false,
+    fullscreenable: false,
+    skipTaskbar: true,
+    alwaysOnTop: top,
+    show: false,
+    title: "倒计时",
+    webPreferences: {
+      preload: path.join(__dirname, "preload.js"),
+      contextIsolation: true,
+      nodeIntegration: false,
+      /* 把"是否启用系统磨砂"透给页面：磨砂模式下卡片必须全透明，否则会把它盖住 */
+      additionalArguments: [
+        "--wgt-acrylic=" + (USE_ACRYLIC ? "1" : "0"),
+        "--wgt-dlayer=" + (desktopLayerOn() ? "1" : "0"),
+        "--wgt-card=timer",
+        "--wgt-theme=" + resolvedTheme(),
+      ],
+      backgroundThrottling: false, // 后台不降频，否则切走再回来数字是旧的
+      zoomFactor: z,
+    },
+  });
+
+  cardWin = w;   /* 之前漏了这一句：所有用到 cardWin 的地方都拿不到窗口 */
+
+  /* 桌面快照：赶在 show 之前抓（否则快照里嵌着卡片自己）。磨砂模式有真模糊，不用快照 */
+  if (!USE_ACRYLIC) {
+    const bdlog = (s) => {
+      try {
+        appendLog(
+          new Date().toISOString() + " " + s + "\n");
+      } catch (e) {}
+    };
+    BD = createBackdrop({ getHwnd: () => hwndOf(w), log: bdlog });
+    BD.capture({ hide: false });
+  }
+
+  if (top) w.setAlwaysOnTop(true, "floating");
+
+  /* 事件留痕（%APPDATA%\TimerCard\win-events.log）：窗口生命周期事件很罕见，
+     一旦用户再报"卡片自己消失/弹出"，这就是精确现场。 */
+  const evlogSafe = (msg) => {
+    try {
+      appendLog(
+        new Date().toISOString() + " " + msg + "\n");
+    } catch (e) { /* 日志失败不影响功能 */ }
+  };
+
+  /* ---------- 智能置顶：Win+D「显示桌面」的唯一免疫手段 ----------
+     本机实测（用 desktopCapturer 可信截图为证）：Win+D 会把所有**非置顶**窗口在
+     合成层直接收走，而且不给 Electron 任何事件、IsWindowVisible 仍是 true、
+     DwmGetWindowAttribute 的 cloak 仍为 0、渲染进程 visibilityState 仍是 visible
+     —— 程序侧完全无感，靠事件反击不可能（试过 WS_EX_TOOLWINDOW 工具窗样式，无效）。
+     唯一免疫的是置顶窗口（WS_EX_TOPMOST）。
+     所以按需置顶：
+       · 用户在菜单里勾了「窗口置顶」→ 一直置顶，本逻辑不插手；
+       · 没勾 → 平时不置顶（老实待在别的窗口后面），只在「显示桌面」期间临时置顶，
+         桌面收回去后立刻撤销。
+     识别信号（实测）：显示桌面时前台窗口变成 Progman，屏幕中心落在桌面图标层
+     （SysListView32）。只要屏幕中心被任何应用窗口（包括自家卡片）占着，就绝不置顶，
+     避免平时乱冒头。 */
+  let _win32 = null;
+  try {
+    const koffi = require("koffi");
+    const user32 = koffi.load("user32.dll");
+    _win32 = {
+      GetForegroundWindow: user32.func("GetForegroundWindow", "void *", []),
+      GetClassNameW: user32.func("GetClassNameW", "int", ["void *", "uint16_t *", "int"]),
+      GetTopWindow: user32.func("GetTopWindow", "void *", ["void *"]),
+      GetWindow: user32.func("GetWindow", "void *", ["void *", "uint32"]),
+      IsWindowVisible: user32.func("IsWindowVisible", "bool", ["void *"]),
+      IsIconic: user32.func("IsIconic", "bool", ["void *"]),
+      GetWindowLongW: user32.func("GetWindowLongW", "int", ["void *", "int"]),
+      GetWindowThreadProcessId: user32.func("GetWindowThreadProcessId", "uint32", ["void *", "uint32 *"]),
+    };
+  } catch (e) { evlogSafe("koffi load err: " + e.message); }   /* 只影响 Win+D 免疫 */
+
+  const DESKTOP_CLASSES = [
+    "Progman", "WorkerW", "SHELLDLL_DefView", "SysListView32",
+    "Shell_TrayWnd", "Shell_SecondaryTrayWnd", "Windows.UI.Core.CoreWindow",
+    /* 系统壳窗口：显示桌面时它们照样可见，但不是"应用窗口"，别让它们把计数抬上去 */
+    "PseudoConsoleWindow", "MonitorDisplayChange", "Xaml_WindowedPopupClass",
+    "TopLevelWindowForOverflowXamlIsland", "ForegroundStaging",
+  ];
+  const _clsBuf = Buffer.alloc(512);
+  const classNameOf = (h) => {
+    try {
+      const n = _win32.GetClassNameW(h, _clsBuf, 256);
+      return n > 0 ? _clsBuf.toString("utf16le", 0, n * 2) : "";
+    } catch (e) { return ""; }
+  };
+  const _pidBuf = Buffer.alloc(4);
+  const pidOf = (h) => {
+    try { _win32.GetWindowThreadProcessId(h, _pidBuf); return _pidBuf.readUInt32LE(0); } catch (e) { return 0; }
+  };
+  const isTopmost = (h) => {
+    try { return (_win32.GetWindowLongW(h, -20) & 0x8) !== 0; } catch (e) { return false; }
+  };
+  const selfHwnd = () => {
+    try {
+      const b = w.getNativeWindowHandle();
+      return b.length >= 8 ? Number(b.readBigUInt64LE(0)) : b.readUInt32LE(0);
+    } catch (e) { return 0; }
+  };
+
+  /* 「显示桌面」判据（v1.0.6 重做）—— 旧做法取 3 个采样点问 WindowFromPoint「谁在最上面」，
+     实测不可靠：Win+D 把窗口收走后，命中谁完全取决于当时的窗口布局，于是同一套代码
+     时而判成"在显示桌面"（卡片一直置顶 → 飘在所有窗口前面），
+     时而判成"不在"（卡片没置顶，被系统一起收走 → 消失）。用户两个症状都是它。
+     新判据两条独立证据必须同时成立：
+       ① 前台是桌面本体（Progman / WorkerW）；
+       ② 屏幕上一扇"普通应用窗口"都不剩了 —— Win+D 会把这些窗口的 IsWindowVisible 直接置 false
+          （实测：正常桌面能看到 6~8 扇；显示桌面时它们从可见列表消失，只剩桌面、任务栏、
+           置顶窗口和桌面级挂件）。
+     ② 正好解开「退出显示桌面、但焦点还留在桌面」这个死结：那一刻前台仍是 Progman，
+     但窗口全都回来了 → 可见应用窗口数 > 2 → 判 false → 撤销置顶 + 沉底。
+     置顶窗口必须排除，因为显示桌面时它们本来就还可见（包括我们自己的卡片）。 */
+  const desktopIsShowing = () => {
+    if (!_win32) return false;
+    try {
+      if (DESKTOP_CLASSES.indexOf(classNameOf(_win32.GetForegroundWindow())) < 0) return false;
+      const me = process.pid;
+      let apps = 0, guard = 0;
+      let h = _win32.GetTopWindow(null);
+      while (h && Number(h) !== 0 && guard++ < 400) {
+        if (_win32.IsWindowVisible(h) && !_win32.IsIconic(h)) {
+          const c = classNameOf(h);
+          if (DESKTOP_CLASSES.indexOf(c) < 0 && pidOf(h) !== me && !isTopmost(h)) apps++;
+        }
+        h = _win32.GetWindow(h, 2);   /* GW_HWNDNEXT = 2 */
+      }
+      /* ★ 阈值必须是 0，不能是 3。原来写 apps <= 3：用户开着两三个窗口时点一下
+         桌面（前台变 Progman、这些窗口仍然可见），就被判成"正在显示桌面"
+         → 卡片被 setAlwaysOnTop 顶到所有窗口前面。
+         Win+D 会把所有非置顶顶层窗口的 IsWindowVisible 直接置 false，
+         所以真·显示桌面时 apps 一定是 0。 */
+      return apps === 0;
+    } catch (e) { return false; }
+  };
+
+  let _smartTopOn = null;
+
+  /* ---------- 贴进桌面层（可选，默认关） ----------
+     桌面快捷图标按 Win+D 不动，是因为它们不是窗口，而是住在桌面窗口 Progman 里面
+     （Progman → SHELLDLL_DefView → SysListView32）。Win+D 只收顶层应用窗口，不碰这棵树。
+     想同等待遇，唯一办法是把自己 SetParent 进 Progman（详见 desktop-layer.js）。
+     挂上之后就不需要下面那套轮询判断「是不是在显示桌面」了。 */
+  const dl = createDesktopLayer({ getWin: () => w, log: evlogSafe });
+  DL = dl;   /* 给 sinkWin / restoreTop / wgt:raise 用：它们必须先问"是不是在桌面层里" */
+  /* 桌面层里的"谁在前面"由主进程按光标坐标决定。
+     为什么不用页面里的 mouseenter：挂进 Progman 之后页面收不到鼠标进入事件（实测
+     WindowFromPoint 落在 Progman 本体上），页面那套 hover 抬升等于失效。
+     几何判断不看遮挡，但两张卡都在桌面层、都被应用窗口盖住时，抬一下也无害。 */
+  if (dl.available) {
+    let inside = null;
+    setInterval(() => {
+      if (w.isDestroyed() || !dl.isOn()) { inside = null; return; }
+      const p = screen.getCursorScreenPoint();
+      const b = w.getBounds();
+      const now = p.x >= b.x && p.x < b.x + b.width && p.y >= b.y && p.y < b.y + b.height;
+      if (now === inside) return;
+      inside = now;
+      if (now) dl.raise();
+    }, 120);
+  }
+  /* 勾了「窗口置顶」就不进桌面层：子窗口 setAlwaysOnTop 无效，
+     两者互斥。否则重启后又贴回桌面层，置顶白设。 */
+  if (dl.available && desktopLayerOn() && !top) {
+    w.once("show", () => setTimeout(() => {
+      if (!desktopLayerOn()) return;
+      dl.set(true).then((ok) => {
+        evlogSafe("dlayer startup " + ok);
+        /* SetParent 会清掉窗口区域，必须挂完再裁一次 */
+        if (ok) applyCardRegion(w, true);
+      });
+    }, 700));
+  }
+  if (dl.available) {
+    setInterval(() => {
+      if (desktopLayerOn()) dl.ensure();
+      applyCardRegion(w);        /* 区域被冲掉就补；还在就直接 return */
+    }, 3000);
+  }
+
+  const applyTop = (on) => {
+    if (w.isDestroyed()) return;
+    try {
+      if (on) w.setAlwaysOnTop(true, "floating");
+      else {
+        w.setAlwaysOnTop(false);
+        setTimeout(() => sinkWin(w), 60);   /* 撤销置顶≠沉下去，见 sinkWin 的说明 */
+      }
+    } catch (e) { /* 切换失败不影响其他功能 */ }
+  };
+  if (_win32) {
+    let tick = 0;
+    let wantTop = top;
+    setInterval(() => {
+      if (w.isDestroyed()) return;
+      if (dl.isOn()) { _smartTopOn = null; return; }   /* 已在桌面层，不需要置顶这套 */
+      tick++;
+      if ((tick % 5) === 0) {            /* 每 ~1s 读一次用户设置：够快，也不折腾磁盘 */
+        try { wantTop = readState().top === true; } catch (e) { /* 读不到就沿用上次 */ }
+      }
+      if (wantTop) { _smartTopOn = null; return; }   /* 用户要常驻置顶：交给设置，不插手 */
+      const showing = desktopIsShowing();
+      const curTop = isTopmost(selfHwnd());
+      if ((tick % 25) === 0) {           /* 每 ~5s 一条心跳：再出问题可以直接看现场 */
+        evlogSafe(`tick showing=${showing} top=${curTop} fg=${classNameOf(_win32.GetForegroundWindow())}`);
+      }
+      _smartTopOn = showing;
+      /* 幂等校正：不看"上一轮判过什么"，只看"这一轮该不该置顶"。
+         状态机一旦被外部改乱（系统在切换瞬间强行隐藏/置顶窗口），这里每 200ms 拉回一次。 */
+      if (showing && !curTop) { evlogSafe("apply ON  fg=" + classNameOf(_win32.GetForegroundWindow())); applyTop(true); }
+      else if (!showing && curTop) { evlogSafe("apply OFF fg=" + classNameOf(_win32.GetForegroundWindow())); applyTop(false); }
+    }, 200);
+  }
+
+  /* 窗口事件留痕 */
+  const evlog = (ev) => {
+    try {
+      appendLog(
+        new Date().toISOString() + " " + ev + "\n");
+    } catch (e) { /* 日志失败不影响功能 */ }
+  };
+  ["minimize", "restore", "show", "hide"].forEach((ev) => w.on(ev, () => evlog(ev)));
+
+
+  /* 定位权限放行，拿不到会自动降级到网络定位 */
+  try {
+    /* 只放给本地页面：handler 挂在**默认 session** 上，幽灵输入窗同属一个 session，
+       不限定来源等于给任何被导航过去的页面开定位权限。 */
+    w.webContents.session.setPermissionRequestHandler((wc, permission, cb) => {
+      const url = (wc && wc.getURL && wc.getURL()) || "";
+      cb(permission === "geolocation" && url.startsWith("file://"));
+    });
+  } catch (e) { /* 某些版本没有该方法 */ }
+
+  w.loadFile(path.join(__dirname, "widget.html"));
+
+  w.once("ready-to-show", () => {
+    w.show();
+    pushBackdrop(260);
+    applyCardRegion(w);       /* 圆角外的黑三角：窗口裁成圆角矩形后就不存在了 */
+  });
+
+  /* 位置记忆（拖动会高频触发，做节流） */
+  let moveTimer = null;
+  w.on("moved", () => {
+    clearTimeout(moveTimer);
+    moveTimer = setTimeout(() => {
+      if (w.isDestroyed()) return;
+      const b = w.getBounds();
+      patchState({ x: b.x, y: b.y });
+    }, 400);
+  });
+
+  /* ★ 关卡片要连幽灵输入窗一起销毁。它是个隐藏的 BrowserWindow（skipTaskbar），
+     只要还活着 Electron 就认为"还有窗口没关"，window-all-closed 永远不触发 ——
+     点右上角 × 之后进程留在后台，任务栏看不到、界面上也没有任何入口，
+     只能去任务管理器杀。触发路径：桌面层模式（默认就开着）下双击输入时间
+     → 建隐形输入窗 → 点 ×。 */
+  w.on("closed", () => {
+    cardWin = null;
+    imeTarget = null;
+    if (imeWin && !imeWin.isDestroyed()) { try { imeWin.destroy(); } catch (e) {} }
+    imeWin = null;
+    closeLookWin();
+    closeSoundWin();
+  });
+
+  return w;
+}
+
+/* ---------- IP 归属查询（主进程） ----------
+   Node 的 fetch 走直连，不读系统代理；渲染进程的 fetch 会跟随 Windows 系统代理，
+   一旦机器上挂着代理/VPN，出口 IP 就在境外，定位会错到别的国家。 */
+const GEO_SOURCES = [
+  {
+    id: "ip.sb",
+    url: "https://api.ip.sb/geoip",
+    pick: (d) => (d && d.latitude != null) ? {
+      lat: d.latitude, lon: d.longitude,
+      city: d.city, tz: d.timezone || "", cc: d.country_code || "",
+    } : null,
+  },
+  {
+    id: "ipwho",
+    url: "https://ipwho.is/?lang=zh-CN",
+    pick: (d) => (d && d.success !== false && d.latitude != null) ? {
+      lat: d.latitude, lon: d.longitude,
+      city: d.city || d.region,
+      tz: (d.timezone && d.timezone.id) || "", cc: d.country_code || "",
+    } : null,
+  },
+];
+
+/* 开机自启：绿色版会把 exe 解到临时目录再运行，直接用 process.execPath 会指向临时文件，
+   electron-builder 的 portable 运行器给了 PORTABLE_EXECUTABLE_FILE，优先用它。 */
+function launchExePath() {
+  return process.env.PORTABLE_EXECUTABLE_FILE || process.execPath;
+}
+
+function getAutoStart() {
+  try {
+    return app.getLoginItemSettings({ path: launchExePath() }).openAtLogin === true;
+  } catch (e) {
+    return false;
+  }
+}
+
+function setAutoStart(on) {
+  try {
+    app.setLoginItemSettings({ openAtLogin: !!on, path: launchExePath(), args: [] });
+    return getAutoStart();
+  } catch (e) {
+    return false;
+  }
+}
+
+/* ---------- 桌面空白处右键菜单 ----------
+   往 HKCU\Software\Classes\DesktopBackground\Shell 下写一项，不碰 HKLM、不需要管理员。
+   Explorer 会实时读这个位置，写完立刻生效；关掉就删掉整项。 */
+const DESKTOP_MENU_KEY = "HKCU\\Software\\Classes\\DesktopBackground\\Shell\\PomodoroWidget";
+
+function reg(args) {
+  return new Promise((resolve) => {
+    try {
+      execFile("reg", args, { windowsHide: true }, (err) => resolve(!err));
+    } catch (e) {
+      resolve(false);
+    }
+  });
+}
+
+function getDesktopMenu() {
+  return reg(["query", DESKTOP_MENU_KEY]);
+}
+
+async function setDesktopMenu(on) {
+  if (!on) {
+    await reg(["delete", DESKTOP_MENU_KEY, "/f"]);
+    return getDesktopMenu();
+  }
+  const exe = launchExePath();
+  await reg(["add", DESKTOP_MENU_KEY, "/ve", "/d", "打开番茄钟", "/f"]);
+  await reg(["add", DESKTOP_MENU_KEY, "/v", "Icon", "/d", exe, "/f"]);
+  /* 命令里带空格必须自己加引号，reg 不会替你转义 */
+  await reg(["add", DESKTOP_MENU_KEY + "\\command", "/ve", "/d", '"' + exe + '"', "/f"]);
+  return getDesktopMenu();
+}
+
+/* ================= 到点提醒 =================
+   原来只有 shell.beep() 三声，人不在电脑前就错过。现在：
+     · 系统 toast 通知（点通知 = 我知道了）
+     · 响铃可循环，直到用户点掉（设置里可关）
+   两者都用 state.sound 里的开关控制。 */
+let alarmTimer = null, alarmBeeps = 0, alarmNote = null;
+
+/* 可选的提示音（文件在 assets/，由 tools/make-alarm.py 合成） */
+const ALARM_SOUNDS = [
+  ["a-dingdong", "叮咚（清亮，最像提醒）"],
+  ["b-soft", "柔和三连（不刺耳）"],
+  ["c-beep", "电子表（三短声）"],
+  ["d-bell", "低钟（沉稳）"],
+  ["e-wood", "木质叩击（嗒嗒）"],
+  ["system", "系统提示音（原来的）"],
+];
+
+function soundName() {
+  const n = (readState().sound || {}).name;
+  return ALARM_SOUNDS.some(([id]) => id === n) ? n : "a-dingdong";
+}
+
+function soundCfg() {
+  const s = readState().sound || {};
+  return { mute: s.mute === true, loop: s.loop !== false, name: soundName() };
+}
+
+function stopAlarmSound() {
+  if (alarmTimer) { clearTimeout(alarmTimer); alarmTimer = null; }
+  alarmBeeps = 0;
+  if (alarmNote) { try { alarmNote.close(); } catch (e) {} alarmNote = null; }
+}
+
+function startAlarm(info) {
+  stopAlarmSound();
+  const cfg = soundCfg();
+
+  /* 声音交给页面放（页面有 Audio 元素，能循环、能换文件）。
+     只有选"系统提示音"时这里才 beep —— 也当作页面音频失败时的兜底。 */
+  if (!cfg.mute && cfg.name === "system") {
+    const startedAt = Date.now();
+    const tick = () => {
+      alarmBeeps++;
+      try { shell.beep(); } catch (e) {}
+      if (!cfg.loop && alarmBeeps >= 3) { alarmTimer = null; return; }
+      /* 封顶 2 分钟：人不在就一直响会烦；声音停，卡片继续红闪 */
+      if (Date.now() - startedAt > 120000) { alarmTimer = null; return; }
+      alarmTimer = setTimeout(tick, 1200);
+    };
+    tick();
+  }
+
+  const mins = Number(info && info.minutes) || 0;
+  const over = Number(info && info.overdueMin) || 0;
+  const phase = info && info.phase;
+  try {
+    appendLog(
+      new Date().toISOString() + ` alarm phase=${phase} minutes=${mins} overdue=${over} mute=${cfg.mute} loop=${cfg.loop} toast=${Notification.isSupported()}\n`);
+  } catch (e) {}
+  /* 番茄钟：按刚结束的阶段给不同文案；plain=普通倒计时 */
+  let title = "时间到";
+  let body = over > 0 ? `已超时 ${over} 分钟` : (mins > 0 ? `${mins} 分钟已到` : "时间到了");
+  if (phase === "work") {
+    title = "专注结束";
+    body = "休息一下吧";
+  } else if (phase === "break") {
+    title = "休息结束";
+    body = "继续下一个番茄吧";
+  } else if (phase === "longBreak") {
+    title = "长休息结束";
+    body = "回来继续专注吧";
+  } else if (over > 0) {
+    body = `已超时 ${over} 分钟`;
+  }
+
+  try {
+    if (Notification.isSupported()) {
+      alarmNote = new Notification({ title: title, body: body, silent: true });
+      alarmNote.on("click", () => {
+        stopAlarmSound();
+        if (cardWin && !cardWin.isDestroyed()) {
+          try { cardWin.webContents.send("timer:dismiss"); } catch (e) {}
+          try { cardWin.show(); } catch (e) {}
+        }
+      });
+      alarmNote.show();
+    }
+  } catch (e) { /* 通知不可用不影响响铃和闪红 */ }
+}
+
+async function buildMenu() {
+  const st = readState();
+  const onTop = st.top === true;
+  const desktopMenu = await getDesktopMenu();
+
+  return Menu.buildFromTemplate([
+    { label: "重置计时", accelerator: "F5", click: () => cardWin && cardWin.webContents.send("timer:reset") },
+    { label: "跳过当前阶段（番茄钟）", accelerator: "F6", click: () => cardWin && cardWin.webContents.send("timer:skip") },
+    { label: "再看一次引导", click: () => cardWin && cardWin.webContents.send("timer:hint") },
+    { type: "separator" },
+    { label: "专注 25 分钟", click: () => cardWin && cardWin.webContents.send("wgt:preset", 25) },
+    { label: "专注 50 分钟", click: () => cardWin && cardWin.webContents.send("wgt:preset", 50) },
+    { type: "separator" },
+    /* 提示音打开独立浮窗（贴在卡片外侧）：卡片太小，面板塞进去字看不清。
+       浮窗里鼠标移到某一行就试听 —— 原生菜单没有 hover，做不到这个。 */
+    { label: "提示音…", click: () => toggleSoundWin() },
+    { label: "设置（番茄钟 / 外观）…", click: () => toggleLookWin() },
+    { type: "separator" },
+    { type: "separator" },
+    {
+      label: "桌面右键菜单显示",
+      type: "checkbox",
+      checked: desktopMenu,
+      click: async (item) => {
+        /* 写失败（权限/组策略）就如实回弹，别让勾选状态骗人 */
+        item.checked = await setDesktopMenu(item.checked);
+      },
+    },
+    {
+      label: "开机自动启动",
+      type: "checkbox",
+      checked: getAutoStart(),
+      click: (item) => setAutoStart(item.checked),
+    },
+    { type: "separator" },
+    {
+      label: "所有窗口置顶（关掉就常驻桌面）",
+      type: "checkbox",
+      checked: onTop,
+      click: (item) => { setTopState(cardWin, item.checked); },
+    },
+    { type: "separator" },
+    { label: "退出", role: "quit" },
+  ]);
+}
+
+/* 只允许一个实例，重复双击只把已开的窗口提到前面 */
+if (!app.requestSingleInstanceLock()) {
+  app.quit();
+} else {
+  app.on("second-instance", () => {
+    createWindow();
+  });
+}
+
+app.whenReady().then(() => {
+  /* 系统切深浅色时，跟随系统的那张卡要立刻变 */
+  try { nativeTheme.on("updated", () => { if (themeSetting() === "auto") pushTheme(); }); } catch (e) {}
+  /* 这里才定磨砂/投影边距：贴进桌面层时系统磨砂不可用，必须改走透明自绘 */
+  /* ★ 真透明必须放弃 acrylic：acrylic 的窗口是不透明的，一旦不设窗口区域，
+     四角就变成直角（2.5.0 那次翻车就是这么来的）。
+     照待办卡的做法：真透明 = 不设区域 + 窗口 transparent。 */
+  USE_ACRYLIC = acrylicSupported() && !desktopLayerOn();
+  PAD = 0;
+  createWindow();
+  startDesktopWatch();   /* 桌面上松开左键 / 20 秒兜底 → 重抓快照 */
+  registerImeIpc();      /* 桌面层里子窗口拿不到键盘焦点，搜索框靠幽灵输入窗代收 */
+
+  /* 快捷键兜底：贴进桌面后万一看不见，Ctrl+Alt+2 一键切回普通窗口（会重启自己） */
+  /* ★ 不注册任何全局快捷键：Ctrl+Alt+2 这种没人记得住，还会和其他软件抢按键。
+     所有操作都走右键菜单（置顶 / 卡片大小 / 外观…）。 */
+
+  const senderWin = (e) => BrowserWindow.fromWebContents(e.sender);
+
+  /* 拖动整张卡（页面只报按下/松开，位移由主进程跟着系统光标搬，见 dragBegin 说明） */
+  ipcMain.on("wgt:drag-begin", (e) => {
+    const w = senderWin(e);
+    if (!w || w.isDestroyed()) return;
+    dragBegin(w);
+  });
+
+  ipcMain.on("wgt:resize-begin", (e, corner) => {
+    const w = senderWin(e);
+    if (w) resizeBegin(w, String(corner || "br"));
+  });
+  ipcMain.on("wgt:resize-end", (e) => {
+    const w = senderWin(e);
+    if (w) resizeStop(w);
+  });
+
+  ipcMain.on("wgt:drag-end", (e) => {
+    const w = senderWin(e);
+    if (!w || w.isDestroyed()) return;
+    dragStop(w, true);
+  });
+
+  /* ---------- 桌面快照背景 + 外观（透明度/磨砂，与待办卡同款） ---------- */
+  ipcMain.on("wgt:editing", (_e, on) => { editingNow = !!on; });
+  ipcMain.on("wgt:close-look", () => closeLookWin());
+  ipcMain.on("wgt:close-sound", () => closeSoundWin());
+  /* 卡片上的图钉：读当前状态 / 切换 */
+  ipcMain.handle("wgt:get-top", () => readState().top === true);
+  ipcMain.handle("wgt:get-layout", () => (layoutIsWide() ? "wide" : "full"));
+  ipcMain.on("wgt:set-layout", (e, v) => {
+    const want = v === "wide" ? "wide" : "full";
+    if ((want === "wide") === layoutIsWide()) return;
+    patchState({ layout: want });
+    applyLayout(senderWin(e) || cardWin);
+  });
+  ipcMain.on("wgt:toggle-top", (e) => {
+    const w = senderWin(e) || cardWin;
+    setTopState(w, !(readState().top === true));
+  });
+  ipcMain.handle("wgt:get-sound", () => soundCfg());
+  ipcMain.on("wgt:set-sound", (_e, v) => {
+    const cur = readState().sound || {};
+    /* 两种调用方式都支持：卡片页面传名字，提示音浮窗传 {mute, loop, name} 整包 */
+    if (typeof v === "string") {
+      if (!ALARM_SOUNDS.some(([id]) => id === v)) return;
+      patchState({ sound: { ...cur, name: v } });
+      return;
+    }
+    const o = (v && typeof v === "object") ? v : {};
+    const ok = ALARM_SOUNDS.some(([id]) => id === o.name) ? o.name : (cur.name || soundName());
+    patchState({ sound: { mute: o.mute === true, loop: o.loop !== false, name: ok } });
+  });
+  ipcMain.handle("wgt:backdrop-now", () => bdPayload());
+  /* 番茄钟配置：设置浮窗和卡片都走这里，主进程是权威 */
+  ipcMain.handle("wgt:get-pomo", () => readPomo());
+  ipcMain.handle("wgt:set-pomo", (_e, v) => {
+    const o = (v && typeof v === "object") ? v : {};
+    const pomo = {
+      workMin: clampInt(o.workMin, 1, 60, POMO_DEFAULT.workMin),
+      breakMin: clampInt(o.breakMin, 1, 60, POMO_DEFAULT.breakMin),
+      longBreakMin: clampInt(o.longBreakMin, 1, 60, POMO_DEFAULT.longBreakMin),
+      longEvery: clampInt(o.longEvery, 0, 12, POMO_DEFAULT.longEvery),
+      autoCycle: o.autoCycle !== false,
+    };
+    patchState({ pomo });
+    if (cardWin && !cardWin.isDestroyed()) {
+      try { cardWin.webContents.send("wgt:pomo", pomo); } catch (e) {}
+    }
+    return pomo;
+  });
+  /* 设置浮窗：除了透明度，其余几项也走这里（卡片太小，塞卡片里看不清） */
+  ipcMain.handle("wgt:get-settings", () => ({
+    theme: themeSetting(),
+    unit: (readState().unit || "min") === "sec" ? "sec" : "min",
+  }));
+  ipcMain.handle("wgt:set-settings", (e, v) => {
+    const o = (v && typeof v === "object") ? v : {};
+    appendLog("set-settings " + JSON.stringify(o) + " cur(layout=" + (layoutIsWide() ? "wide" : "full") +
+              " theme=" + themeSetting() + " unit=" + (readState().unit || "min") + " scale=" + readScale() + ")");
+    if (o.theme === "auto" || o.theme === "light" || o.theme === "dark") {
+      patchState({ theme: o.theme });
+      pushTheme();
+    }
+    if (o.unit === "min" || o.unit === "sec") {
+      patchState({ unit: o.unit });
+      try { if (cardWin && !cardWin.isDestroyed()) cardWin.webContents.send("timer:unit", o.unit); } catch (x) {}
+    }
+    return {
+      theme: themeSetting(),
+      unit: (readState().unit || "min") === "sec" ? "sec" : "min",
+    };
+  });
+  ipcMain.handle("wgt:get-look", () => readState().look || null);
+  ipcMain.handle("wgt:set-look", (e, v) => {
+    const o = (v && typeof v === "object") ? v : {};
+    const look = {
+      alpha: Math.min(1, Math.max(0.08, Number(o.alpha) || 1)),
+      frost: Math.min(20, Math.max(0, Number(o.frost) || 0)),
+    };
+    patchState({ look });
+    /* 浮窗里改的，卡片得跟着变 */
+    if (cardWin && !cardWin.isDestroyed()) {
+      try { cardWin.webContents.send("wgt:look", look); } catch (er) {}
+    }
+    return look;
+  });
+
+  /* 倒计时到点：弹系统通知 + 响铃（页面只管闪红）
+     设置里两个开关：到点静音 / 循环响（不循环就只响三声）。 */
+  ipcMain.on("timer:done", (_e, info) => startAlarm(info));
+  /* 用户点掉提醒（点卡片 / 点通知）→ 立刻停声 */
+  ipcMain.on("timer:dismiss", () => stopAlarmSound());
+
+  /* 睡眠/休眠唤醒后，页面要按时间戳重算（否则睡 10 分钟回来还是旧数字） */
+  try {
+    powerMonitor.on("resume", () => {
+      if (cardWin && !cardWin.isDestroyed()) {
+        try { cardWin.webContents.send("wgt:resume"); } catch (e) {}
+      }
+    });
+  } catch (e) {}
+
+  ipcMain.on("wgt:close", (e) => {
+    const w = senderWin(e);
+    if (w) w.close();
+  });
+
+  ipcMain.on("wgt:menu", async (e) => {
+    const w = senderWin(e);
+    if (!w) return;
+    const m = await buildMenu();
+    /* 菜单弹出时卡片会失焦、鼠标也离开页面。标记一下，免得这时候被"还原到后面"，
+       结果菜单还开着、卡片已经被别的窗口盖住。 */
+    w.__menuOpen = true;
+    w.__restPending = false;
+    m.popup({
+      window: w,
+      callback: () => {
+        if (w.isDestroyed()) return;
+        w.__menuOpen = false;
+        if (!w.__restPending) return;
+        w.__restPending = false;
+        restoreTop(w);
+      },
+    });
+  });
+
+  /* ---------- 鼠标指上来就临时浮到最前 ----------
+     按"点一下"才浮上来太迟钝；hover 即抬升、移开即还原 —— 都是临时的，
+     不写进存档，用户自己在菜单里设的"窗口置顶"不能被它改掉。 */
+  ipcMain.on("wgt:raise", (e) => {
+    const w = senderWin(e);
+    if (!w || w.isDestroyed()) return;
+    /* 桌面层里：只把自己的兄弟 z 序抬到最前（这样鼠标指哪张卡、哪张卡就在上面，
+       不会出现"待办永远压在倒计时后面"）。绝不能 setAlwaysOnTop —— 子窗口置顶无意义，
+       而且下一次"撤销置顶"会把卡片沉进图标层后面（就是消失的那个 bug）。 */
+    if (DL && DL.isOn()) { DL.raise(); return; }
+    w.__hoverTop = true;
+    if (!w.isAlwaysOnTop()) w.setAlwaysOnTop(true, "floating");
+    /* ★ 只打上"置顶"这个样式并不会改变它在置顶层里的前后位置：
+       其他窗口本来就是置顶的时候，光 setAlwaysOnTop 翻不上去 —— 实测 z 序一点没变。
+       必须再主动提一次。 */
+    w.moveTop();
+  });
+
+  ipcMain.on("wgt:rest", (e) => {
+    const w = senderWin(e);
+    if (!w || w.isDestroyed()) return;
+    if (DL && DL.isOn()) return;   /* 桌面层里鼠标移开也不还原层级：一还原就是沉底 = 消失 */
+    w.__hoverTop = false;
+    if (w.__menuOpen) { w.__restPending = true; return; }   /* 菜单还开着，等它关了再沉 */
+    restoreTop(w);
+  });
+
+});
+
+app.on("window-all-closed", () => { app.quit(); });
+

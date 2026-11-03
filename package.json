@@ -1,0 +1,93 @@
+{
+  "name": "pomodoro-card",
+  "productName": "PomodoroCard",
+  "version": "1.0.0",
+  "description": "番茄钟 —— 桌面小卡：专注 / 休息自动循环，到点提醒（Electron 独立版）",
+  "author": {
+    "name": "sq907259434"
+  },
+  "license": "MIT",
+  "main": "main.js",
+  "scripts": {
+    "start": "electron .",
+    "icon": "node tools/make-icon.js && python tools/pack-ico.py",
+    "dist": "electron-builder --win",
+    "dist:dir": "electron-builder --win --dir"
+  },
+  "devDependencies": {
+    "electron": "^33.4.11",
+    "electron-builder": "25.1.8"
+  },
+  "build": {
+    "appId": "com.pomodoro.desktop",
+    "productName": "PomodoroCard",
+    "copyright": "Copyright © 2026 sq907259434",
+    "asar": true,
+    "compression": "maximum",
+    "npmRebuild": false,
+    "directories": {
+      "output": "dist"
+    },
+    "files": [
+      "main.js",
+      "desktop-layer.js",
+      "backdrop.js",
+      "preload.js",
+      "widget.html",
+      "assets",
+      "ime.html",
+      "ime-preload.js",
+      "icon.png",
+      "package.json",
+      "look.html",
+      "look-preload.js",
+      "sound.html",
+      "sound-preload.js"
+    ],
+    "win": {
+      "icon": "icon.ico",
+      "target": [
+        {
+          "target": "nsis",
+          "arch": [
+            "x64"
+          ]
+        },
+        {
+          "target": "portable",
+          "arch": [
+            "x64"
+          ]
+        }
+      ],
+      "artifactName": "${productName}-${version}-${arch}-setup.${ext}"
+    },
+    "portable": {
+      "artifactName": "${productName}-${version}-${arch}-portable.${ext}",
+      "requestExecutionLevel": "user"
+    },
+    "nsis": {
+      "oneClick": false,
+      "perMachine": false,
+      "allowToChangeInstallationDirectory": true,
+      "createDesktopShortcut": true,
+      "createStartMenuShortcut": true,
+      "shortcutName": "番茄钟",
+      "uninstallDisplayName": "番茄钟",
+      "runAfterFinish": true,
+      "deleteAppDataOnUninstall": false,
+      "multiLanguageInstaller": true,
+      "language": "2052",
+      "include": "build/installer.nsh",
+      "installerIcon": "icon.ico",
+      "uninstallerIcon": "icon.ico",
+      "installerHeaderIcon": "icon.ico"
+    },
+    "asarUnpack": [
+      "assets/**"
+    ]
+  },
+  "dependencies": {
+    "koffi": "^3.3.5"
+  }
+}
