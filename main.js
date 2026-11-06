@@ -1448,8 +1448,10 @@ async function buildMenu() {
   const desktopMenu = await getDesktopMenu();
 
   return Menu.buildFromTemplate([
-    { label: "重置计时", accelerator: "F5", click: () => cardWin && cardWin.webContents.send("timer:reset") },
-    { label: "跳过当前阶段（番茄钟）", accelerator: "F6", click: () => cardWin && cardWin.webContents.send("timer:skip") },
+    /* 2026-11-06 用户要求：快捷键一个都不要。菜单项只保留点击，
+       不挂 accelerator（既不显示 F5/F6，也不抢系统按键）。 */
+    { label: "重置计时", click: () => cardWin && cardWin.webContents.send("timer:reset") },
+    { label: "跳过当前阶段（番茄钟）", click: () => cardWin && cardWin.webContents.send("timer:skip") },
     { label: "再看一次引导", click: () => cardWin && cardWin.webContents.send("timer:hint") },
     { type: "separator" },
     { label: "专注 25 分钟", click: () => cardWin && cardWin.webContents.send("wgt:preset", 25) },

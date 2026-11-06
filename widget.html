@@ -306,20 +306,26 @@
   .hint.on{ opacity:1; }
   body.light .hint{ color:rgba(0,0,0,.42); }
 
-  /* 番茄钟阶段标签：运行/暂停/到点时显示在顶部中央（设定态 presets 占着顶部，隐藏） */
+  /* 番茄钟阶段标签：运行/暂停/到点时显示在顶部中央（设定态 presets 占着顶部，隐藏）
+     2026-11-06：原 11px + 55% 白，贴在桌面壁纸上几乎看不清 → 字号/字重/对比度一起提。 */
   .phase{
-    position:absolute; left:0; right:0; top:12px; z-index:6;
-    text-align:center; font-size:11px; letter-spacing:1.2px; white-space:nowrap;
-    color:rgba(255,255,255,.55); pointer-events:none;
+    position:absolute; left:0; right:0; top:10px; z-index:6;
+    text-align:center; font-size:16px; font-weight:600; letter-spacing:.8px; white-space:nowrap;
+    color:rgba(255,255,255,.90); pointer-events:none;
+    text-shadow:0 1px 5px rgba(0,0,0,.40);
     opacity:0; transition:opacity .22s ease, color .22s ease;
   }
   .card.pomodoro.run .phase, .card.pomodoro.pause .phase, .card.pomodoro.alarm .phase{ opacity:1; }
-  body.light .phase{ color:rgba(0,0,0,.5); }
+  body.light .phase{ color:rgba(0,0,0,.78); text-shadow:none; }
   /* 休息阶段换成绿色，长休息换成蓝色，一眼区分 */
   .card.phase-break .phase{ color:#7FD3A0; }
   body.light .card.phase-break .phase{ color:#2E8B57; }
   .card.phase-long .phase{ color:#8FB8E8; }
   body.light .card.phase-long .phase{ color:#3A6EA5; }
+  /* 横版小窗只有 213x93：58px 的数字从 17px 起，顶部还悬着 ← / 切换 / × 三个按钮。
+     标签单独给 13px 贴到最上沿；鼠标移上去按钮出现时先让位，免得字被按钮压住。 */
+  body.wide .card .phase{ top:2px; font-size:13px; letter-spacing:.3px; line-height:1.1; }
+  body.wide .card:hover .phase{ opacity:0; }
 
 /* 简洁界面左上角的返回箭头：点了回到设定界面 */
   /* 中间上方的图钉：悬停出现，点了钉在最前（再点取消） */
@@ -936,6 +942,9 @@ let remain = 0;          /* 毫秒 */
 let endAt = 0;           /* 运行时的目标时间戳 */
 let raf = null;
 let alarmOn = false;
+/* 「再来一次」和番茄钟阶段切换都会先回 idle 再 start，那一瞬不该被当成
+   "空闲"而把横版小窗切回方形大卡。声明放顶部，两个函数都不会踩到 TDZ。 */
+let skipSquareGuard = false;
 
 try {
   const raw = localStorage.getItem(KEY);
@@ -1276,25 +1285,35 @@ function finish(overdueMs) {
 function nextPhase(auto) {
   clearTimeout(autoNextTimer);
   autoNextTimer = 0;
-  if (alarmOn) stopAlarm();
-  if (phase === "work") {
-    doneCount++;
-    round = doneCount + 1;
-    phase = (pomo.longEvery > 0 && doneCount % pomo.longEvery === 0) ? "longBreak" : "break";
-  } else {
-    phase = "work";
+  /* ★ 2026-11-06 修复：阶段切换中间有一瞬 mode=idle 且红闪已被 stopAlarm() 收掉，
+     render() 末尾的 ensureSquareWhenIdle() 会把它误判成"回到设定界面"，
+     调 setLayout("full") 把横版小窗撑回 260x240 大卡片，并写进 state.layout ——
+     于是休息 5 分钟、以及之后每一轮都一直是大窗口。
+     和 doReset 一样，自动进入下一阶段时整段过渡期禁用该守护，保住用户选的小窗。 */
+  if (auto) skipSquareGuard = true;
+  try {
+    if (alarmOn) stopAlarm();
+    if (phase === "work") {
+      doneCount++;
+      round = doneCount + 1;
+      phase = (pomo.longEvery > 0 && doneCount % pomo.longEvery === 0) ? "longBreak" : "break";
+    } else {
+      phase = "work";
+    }
+    if (raf) { cancelAnimationFrame(raf); raf = null; }
+    stopGuard();
+    mode = "idle";
+    view = "set";
+    minutes = phaseMinutes();
+    remain = minutes * 60000;
+    totalMs = remain;
+    endAt = 0;
+    render();
+    saveRun();
+    if (auto) start();
+  } finally {
+    skipSquareGuard = false;      /* 抛异常也必须复位，否则以后空闲再也不回方形 */
   }
-  if (raf) { cancelAnimationFrame(raf); raf = null; }
-  stopGuard();
-  mode = "idle";
-  view = "set";
-  minutes = phaseMinutes();
-  remain = minutes * 60000;
-  totalMs = remain;
-  endAt = 0;
-  render();
-  saveRun();
-  if (auto) start();
 }
 
 /* 跳过当前阶段：在跑就跳到下一阶段继续跑，停着就只切阶段 */
@@ -1691,8 +1710,7 @@ document.addEventListener("mousedown", (e) => {
   if ($("sndPanel").classList.contains("on") && !e.target.closest("#sndPanel")) $("sndPanel").classList.remove("on");
 }, true);
 
-/* 「再来一次」内部会先回 idle 再 start，那一瞬不该被当成"空闲"切回方形 */
-let skipSquareGuard = false;
+/* 声明见文件顶部变量区（alarmOn 旁）。 */
 
 /* 设置界面只保留方形：横版只用于"倒计时中"。
    否则存档停在横版时重启，滚轮会被塞进 213x93 的横条里。 */
